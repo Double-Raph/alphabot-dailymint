@@ -1,10 +1,10 @@
-// scraper.mjs — v3 (simple, robuste, limité aux 20 premières lignes avec debug)
+// scraper.mjs — v3 (robuste + debug, 20 premières lignes)
 import { chromium } from "playwright";
 import fs from "fs";
 import path from "path";
 
 const URL = "https://www.alphabot.app/projects";
-const MAX_ROWS = Number(process.env.MAX_ROWS || 20); // traite seulement les N premières lignes
+const MAX_ROWS = Number(process.env.MAX_ROWS || 20); // limite
 const OUT_DIR = path.join(process.cwd(), "out");
 
 const todayUTC = new Date();
@@ -49,7 +49,7 @@ async function main() {
     locale: "en-US",
   });
 
-  // Bloque les ressources lourdes (garde CSS/JS)
+  // Bloque images/medias/fonts (plus rapide)
   await context.route("**/*", (route) => {
     const type = route.request().resourceType();
     if (["image", "media", "font"].includes(type)) return route.abort();
@@ -58,7 +58,7 @@ async function main() {
 
   const page = await context.newPage();
 
-  // Anti-bot basique
+  // Anti-bot simple
   await page.addInitScript(() => {
     Object.defineProperty(navigator, "webdriver", { get: () => undefined });
   });
@@ -67,7 +67,7 @@ async function main() {
   page.setDefaultNavigationTimeout(120000);
   page.setDefaultTimeout(60000);
 
-  // Intercepte l'API (si la page charge /projects en JSON)
+  // Interception des réponses API (si la page appelle /projects)
   const apiDumps = [];
   page.on("response", async (res) => {
     try {
@@ -90,27 +90,88 @@ async function main() {
   await page.waitForLoadState("networkidle", { timeout: 20000 }).catch(() => {});
   await page.waitForSelector("table, [role='rowgroup']", { timeout: 45000 });
 
-  // Petit scroll pour forcer le rendu
+  // Scroll léger
   for (let i = 0; i < 3; i++) {
     await page.mouse.wheel(0, 1200);
     await page.waitForTimeout(300);
   }
 
-  // DEBUG: snapshot page
+  // DEBUG: snapshot
   try {
     await page.screenshot({ path: path.join(OUT_DIR, `projects_${stamp}.png`), fullPage: true });
     const html = await page.content();
     fs.writeFileSync(path.join(OUT_DIR, `projects_${stamp}.html`), html, "utf-8");
   } catch {}
 
-  // --- Si API capturée, tente extraction directe (limite MAX_ROWS)
+  // ---- 1) Tentative via API interceptée
   if (apiDumps.length) {
     const items = [];
     for (const dump of apiDumps) {
-      const arr = Array.isArray(dump.json?.data)
+      const data = Array.isArray(dump.json?.data)
         ? dump.json.data
         : Array.isArray(dump.json)
         ? dump.json
         : [];
-      for (const it of arr) {
-        const name = norm(it.name || it.proj
+      for (const it of data) {
+        const name = norm(it.name ?? it.projectName ?? it.title ?? "");
+        const chain = norm(it.chain ?? it.network ?? it.blockchain ?? "").toLowerCase();
+        const twitterUrl = norm(
+          it.twitter ?? it.x ?? it.twitterUrl ?? (it.socials ? it.socials.twitter : "") ?? ""
+        );
+        const supplyRaw = it.supply ?? it.publicSupply ?? it.maxSupply ?? null;
+        const priceRaw = it.publicPrice ?? it.price ?? it.mintPrice ?? "";
+
+        items.push({
+          project: name,
+          mint_raw: norm(it.mintNote ?? it.phase ?? ""), // peut être vide
+          chain,
+          supply: supplyRaw != null ? Number(String(supplyRaw).replace(/[^\d]/g, "")) : null,
+          public_price_raw: String(priceRaw || ""),
+          twitter_handle: handleFromUrl(twitterUrl),
+          twitter_url: twitterUrl || "",
+        });
+
+        if (items.length >= MAX_ROWS) break;
+      }
+      if (items.length >= MAX_ROWS) break;
+    }
+
+    if (items.length) {
+      dumpOutputs(items, apiDumps);
+      await browser.close();
+      return;
+    }
+  }
+
+  // ---- 2) Fallback DOM: lecture des colonnes + clic pour Twitter
+  let headerTexts = [];
+  const headerTh = await page.$$("table thead tr th");
+  if (headerTh.length) {
+    headerTexts = (await Promise.all(headerTh.map((th) => th.innerText()))).map((t) =>
+      t.trim().toUpperCase()
+    );
+  } else {
+    const headers = await page.$$("[role='columnheader']");
+    if (headers.length) {
+      headerTexts = (await Promise.all(headers.map((h) => h.innerText()))).map((t) =>
+        t.trim().toUpperCase()
+      );
+    }
+  }
+
+  const want = ["NAME", "MINT", "CHAIN", "SUPPLY", "PUBLIC"];
+  const idx = {};
+  for (const k of want) idx[k] = headerTexts.findIndex((x) => x.startsWith(k));
+
+  let rowLocs = await page.$$("table tbody tr");
+  if (rowLocs.length === 0) rowLocs = await page.$$("[role='rowgroup'] [role='row']");
+  console.log("Rows detected:", rowLocs.length, "→ processing first", MAX_ROWS);
+
+  const items = [];
+  for (let i = 0; i < Math.min(rowLocs.length, MAX_ROWS); i++) {
+    const row = rowLocs[i];
+
+    let cells = await row.$$("td");
+    if (cells.length === 0) cells = await row.$$("[role='cell']");
+
+    const getCellText = asyn
