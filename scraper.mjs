@@ -186,17 +186,59 @@ async function main() {
     const supply = await getCellText("SUPPLY");
     const pub = await getCellText("PUBLIC");
 
-    // Ouvre la fiche pour choper le lien X
-    let twitterUrl = null;
-    try {
-      await row.click({ delay: 60 });
-      await page.waitForTimeout(350);
-      const tw = await page.locator("a[href*='x.com'], a[href*='twitter.com']").first();
-      if (await tw.count()) twitterUrl = await tw.getAttribute("href");
-      await page.keyboard.press("Escape").catch(() => {});
-      await page.mouse.click(10, 10).catch(() => {});
-      await page.waitForTimeout(120);
-    } catch {}
+// Ouvre la fiche pour choper le lien X **du projet**
+let twitterUrl = null;
+try {
+  await row.click({ delay: 60 });
+  // laisse le popover/modale se rendre
+  await page.waitForTimeout(600);
+
+  // 1) Cherche d'abord DANS la modale/carte (dialog/tooltip/popover/card)
+  const containers = page.locator(
+    "[role='dialog'], [role='tooltip'], [class*='modal'], [class*='popover'], [class*='card']"
+  );
+  if (await containers.count()) {
+    const hrefs = await containers.evaluateAll((nodes) => {
+      const urls = [];
+      nodes.forEach((node) => {
+        node
+          .querySelectorAll("a[href*='x.com'], a[href*='twitter.com']")
+          .forEach((a) => urls.push(a.href));
+      });
+      return urls;
+    });
+    // filtre tout ce qui est Alphabot / partage
+    twitterUrl =
+      hrefs.find(
+        (h) =>
+          h &&
+          !/alphabotapp/i.test(h) &&
+          !/intent|share/i.test(h)
+      ) || null;
+  }
+
+  // 2) Fallback global si pas trouvé dans la modale
+  if (!twitterUrl) {
+    const pageHrefs = await page.evaluate(() =>
+      Array.from(
+        document.querySelectorAll("a[href*='x.com'], a[href*='twitter.com']")
+      ).map((a) => a.href)
+    );
+    twitterUrl =
+      pageHrefs.find(
+        (h) =>
+          h &&
+          !/alphabotapp/i.test(h) &&
+          !/intent|share/i.test(h)
+      ) || null;
+  }
+
+  // ferme la modale/popover
+  await page.keyboard.press("Escape").catch(() => {});
+  await page.mouse.click(10, 10).catch(() => {});
+  await page.waitForTimeout(150);
+} catch {}
+
 
     items.push({
       project: norm(name),
