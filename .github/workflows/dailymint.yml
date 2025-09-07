@@ -1,0 +1,52 @@
+name: Daily Alphabot Scrape
+
+on:
+  schedule:
+    - cron: "30 6 * * *"   # 06:30 UTC ≈ 08:30 Paris été
+  workflow_dispatch: {}
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install deps (Playwright)
+        run: |
+          npm ci
+          npx playwright install --with-deps
+
+      - name: Scrape
+        run: npm run scrape
+
+      - name: Upload artifacts (JSON + CSV)
+        uses: actions/upload-artifact@v4
+        with:
+          name: dailymint-${{ github.run_id }}
+          path: out/*
+
+      - name: Commit daily outputs
+        if: ${{ github.ref == 'refs/heads/main' }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          mkdir -p data
+          cp -r out/* data/ || true
+          git add data || true
+          git commit -m "data: dailymint $(date -u +'%Y-%m-%d')" || echo "nothing to commit"
+          git push || true
+
+      # Optionnel: poste un message Discord si tu ajoutes le secret DISCORD_WEBHOOK_URL
+      - name: Post to Discord
+        if: ${{ secrets.DISCORD_WEBHOOK_URL != '' }}
+        run: |
+          msg="DailyMint $(date -u +'%Y-%m-%d') ready. JSON/CSV attached as artifacts."
+          curl -X POST -H "Content-Type: application/json" \
+            -d "{\"content\":\"${msg}\"}" \
+            "${{ secrets.DISCORD_WEBHOOK_URL }}"
