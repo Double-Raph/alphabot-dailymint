@@ -1,0 +1,13 @@
+{
+  "name": "alphabot-dailymint",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "scrape": "node scraper.mjs",
+    "postinstall": "npx playwright install --with-deps"
+  },
+  "dependencies": {
+    "@playwright/test": "^1.47.0"
+  }
+}
