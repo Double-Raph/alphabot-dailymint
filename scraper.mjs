@@ -174,4 +174,86 @@ async function main() {
     let cells = await row.$$("td");
     if (cells.length === 0) cells = await row.$$("[role='cell']");
 
-    const getCellText = asyn
+    const getCellText = async (k) => {
+      const j = idx[k];
+      if (j < 0 || j >= cells.length) return "";
+      return (await cells[j].innerText()).trim();
+    };
+
+    const name = await getCellText("NAME");
+    const mint = await getCellText("MINT");
+    const chain = await getCellText("CHAIN");
+    const supply = await getCellText("SUPPLY");
+    const pub = await getCellText("PUBLIC");
+
+    // Ouvre la fiche pour choper le lien X
+    let twitterUrl = null;
+    try {
+      await row.click({ delay: 60 });
+      await page.waitForTimeout(350);
+      const tw = await page.locator("a[href*='x.com'], a[href*='twitter.com']").first();
+      if (await tw.count()) twitterUrl = await tw.getAttribute("href");
+      await page.keyboard.press("Escape").catch(() => {});
+      await page.mouse.click(10, 10).catch(() => {});
+      await page.waitForTimeout(120);
+    } catch {}
+
+    items.push({
+      project: norm(name),
+      mint_raw: norm(mint),
+      chain: norm(chain).toLowerCase(),
+      supply: supply ? digits(supply) : null,
+      public_price_raw: norm(pub),
+      twitter_handle: handleFromUrl(twitterUrl),
+      twitter_url: twitterUrl || "",
+    });
+  }
+
+  dumpOutputs(items, apiDumps);
+  await browser.close();
+}
+
+function dumpOutputs(items, apiDumps) {
+  const jsonPath = path.join(OUT_DIR, `alphabot_${stamp}.json`);
+  fs.writeFileSync(jsonPath, JSON.stringify(items, null, 2), "utf-8");
+
+  const header = [
+    "project",
+    "mint_raw",
+    "chain",
+    "supply",
+    "public_price_raw",
+    "twitter_handle",
+    "twitter_url",
+  ];
+  const csv = [
+    header.join(","),
+    ...items.map((x) =>
+      header
+        .map((k) => {
+          const v = x[k] == null ? "" : String(x[k]).replace(/"/g, '""');
+          return /[,"\n]/.test(v) ? `"${v}"` : v;
+        })
+        .join(",")
+    ),
+  ].join("\n");
+  const csvPath = path.join(OUT_DIR, `alphabot_${stamp}.csv`);
+  fs.writeFileSync(csvPath, csv, "utf-8");
+
+  // dumps API (debug)
+  apiDumps.forEach((d, i) => {
+    fs.writeFileSync(
+      path.join(OUT_DIR, `api_projects_${i + 1}.json`),
+      JSON.stringify(d.json, null, 2),
+      "utf-8"
+    );
+  });
+
+  console.log(`Saved: ${jsonPath}`);
+  console.log(`Saved: ${csvPath}`);
+}
+
+main().catch((e) => {
+  console.error(e);
+  process.exit(1);
+});
