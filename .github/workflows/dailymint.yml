@@ -17,10 +17,10 @@ jobs:
         with:
           node-version: 20
 
-      - name: Install deps (Playwright)
-        run: |
-          npm ci
-          npx playwright install --with-deps
+- name: Install deps (Playwright)
+  run: |
+    npm install
+    npx playwright install --with-deps
 
       - name: Scrape
         run: npm run scrape
