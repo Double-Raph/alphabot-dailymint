@@ -27,6 +27,8 @@ jobs:
 
       - name: Scrape
         run: node scraper.mjs
+        env:
+          MAX_ROWS: 20
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
