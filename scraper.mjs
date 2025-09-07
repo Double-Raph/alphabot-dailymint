@@ -4,6 +4,7 @@ import fs from "fs";
 import path from "path";
 
 const URL = "https://www.alphabot.app/projects";
+const MAX_ROWS = Number(process.env.MAX_ROWS || 20);
 
 const todayUTC = new Date();
 const Y = todayUTC.getUTCFullYear();
@@ -66,9 +67,10 @@ async function main() {
   if (rowLocs.length === 0) {
     rowLocs = await page.$$("[role='rowgroup'] [role='row']");
   }
+console.log("Rows detected:", rowLocs.length, "→ processing first", MAX_ROWS);
 
   const items = [];
-  for (let i = 0; i < rowLocs.length; i++) {
+  for (let i = 0; i < Math.min(rowLocs.length, MAX_ROWS); i++) {
     const row = rowLocs[i];
 
     // cellules (td, sinon role=cell)
@@ -112,9 +114,6 @@ async function main() {
       twitter_url: twitterUrl || null,
       twitter_handle: handleFromUrl(twitterUrl),
     });
-
-    // sécurité : limite les 100 premières lignes
-    if (items.length >= 100) break;
   }
 
   // sortie JSON + CSV
