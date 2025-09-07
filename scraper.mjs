@@ -1,5 +1,5 @@
 // scraper.mjs
-import { chromium } from "@playwright/test";
+import { chromium } from "playwright";
 import fs from "fs";
 import path from "path";
 
