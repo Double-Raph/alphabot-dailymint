@@ -2,22 +2,19 @@ name: Daily Alphabot Scrape
 
 on:
   schedule:
-    - cron: "30 6 * * *"     # 06:30 UTC ≈ 08:30 Paris (été)
+    - cron: "30 6 * * *"   # 06:30 UTC ~ 08:30 Paris (été)
   workflow_dispatch: {}
 
 permissions:
-  contents: write            # autorise le commit data/
+  contents: write
 
 jobs:
   run:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Node
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: 20
           cache: "npm"
@@ -28,30 +25,11 @@ jobs:
       - name: Install Playwright browsers
         run: npx playwright install --with-deps chromium
 
-      - name: Debug versions
-        run: |
-          node -v
-          npx playwright --version
-
       - name: Scrape
         run: node scraper.mjs
 
-      - name: Upload artifacts (JSON + CSV)
-        if: success()
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: dailymint-${{ github.run_id }}
+          name: alphabot-${{ github.run_id }}
           path: out/*
-
-      - name: Commit daily outputs
-        if: success() && github.ref == 'refs/heads/main'
-        run: |
-          if [ -d "out" ]; then
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            mkdir -p data
-            cp -r out/* data/ || true
-            git add data || true
-            git commit -m "data: dailymint $(date -u +'%Y-%m-%d')" || echo "nothing to commit"
-            git push || true
-          fi
