@@ -8,6 +8,7 @@
     "postinstall": "npx playwright install --with-deps"
   },
   "dependencies": {
-    "@playwright/test": "^1.47.0"
+    "playwright": "^1.47.0"
   }
 }
+
