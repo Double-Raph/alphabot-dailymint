@@ -156,15 +156,53 @@ async function main() {
       // ignore si pas de popover
     }
 
-    items.push({
-      project: norm(name),
-      mint_raw: norm(mint),              // ex: "4H", "1D", "4H ago"…
-      chain: norm(chain).toLowerCase(),  // eth, sol, base, etc.
-      supply: supply ? digits(supply) : null,
-      public_price_raw: norm(pub),       // "Free", "0.011", etc.
-      twitter_handle: handleFromUrl(twitterUrl),
-      twitter_url: twitterUrl || ""
-    });
+// --- timestamps & filtre "jour même" (UTC)
+const now = new Date();
+const scraped_at_unix = Math.floor(now.getTime() / 1000);
+
+// "5H" à venir (PAS "H ago")
+const ahead = (mint || "").match(/^\s*(\d+)\s*H(?!\s*ago)\b/i);
+const ago   = (mint || "").match(/^\s*(\d+)\s*H\s*ago\b/i);
+
+let event_unix_utc = null;
+if (ahead) {
+  event_unix_utc = scraped_at_unix + Number(ahead[1]) * 3600;
+} else if (ago) {
+  // déjà passé → on ignore cette ligne
+  continue;
+} else {
+  // formats non “H” (ex: "2D", "-", etc.) → on ignore
+  continue;
+}
+
+// garde uniquement les mints du jour (UTC)
+const startUTC = Date.UTC(
+  now.getUTCFullYear(),
+  now.getUTCMonth(),
+  now.getUTCDate(),
+  0, 0, 0
+) / 1000;
+const endUTC = startUTC + 86400;
+if (!(event_unix_utc >= startUTC && event_unix_utc < endUTC)) {
+  continue;
+}
+
+// HH:MM en UTC (pour Twitter)
+const event_utc_hhmm = new Date(event_unix_utc * 1000).toISOString().slice(11, 16);
+
+// ---- push final
+items.push({
+  project: norm(name),
+  mint_raw: norm(mint),              // "4H", "9H", etc.
+  chain: norm(chain).toLowerCase(),  // eth, sol, base...
+  supply: supply ? digits(supply) : null,
+  public_price_raw: norm(pub),       // "Free", "0.011", etc.
+  twitter_handle: handleFromUrl(twitterUrl),
+  twitter_url: twitterUrl || "",
+  scraped_at_unix,
+  event_unix_utc,
+  event_utc_hhmm
+});
   }
 
   // 5) Sauvegarde JSON + CSV
