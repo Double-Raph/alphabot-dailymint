@@ -209,7 +209,18 @@ items.push({
   const jsonPath = path.join(OUT_DIR, `alphabot_${stamp}.json`);
   fs.writeFileSync(jsonPath, JSON.stringify(items, null, 2), "utf-8");
 
-  const header = ["project","mint_raw","chain","supply","public_price_raw","twitter_handle","twitter_url"];
+  const header = [
+  "project",
+  "mint_raw",
+  "chain",
+  "supply",
+  "public_price_raw",
+  "twitter_handle",
+  "twitter_url",
+  "scraped_at_unix",
+  "event_unix_utc",
+  "event_utc_hhmm"
+];
   const csv = [
     header.join(","),
     ...items.map(x => header.map(k => {
