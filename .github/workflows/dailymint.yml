@@ -4,7 +4,12 @@ on:
   schedule:
     # 00:00 et 01:00 UTC → couvre 02:00 Paris toute l'année (DST inclus)
     - cron: "0 0,1 * * *"
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Run now even if not 02:00 Europe/Paris?"
+        required: true
+        default: "false"
 
 permissions:
   contents: write
@@ -15,10 +20,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # ⛳️ Garde-fou : ne continuer que s'il est 02:00 en Europe/Paris
-      - name: Guard – run only at 02:00 Europe/Paris
+      # ✅ Guard: n'exécute qu'à 02:00 Paris SAUF si force=true en manuel
+      - name: Guard – run only at 02:00 Europe/Paris (or force)
         id: guard
         run: |
+          force="${{ github.event.inputs.force }}"
+          if [ "$force" = "true" ]; then
+            echo "Manual override: forcing run."
+            echo "run=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
           hour=$(TZ=Europe/Paris date +%H)
           echo "Paris hour is $hour:00"
           if [ "$hour" = "02" ]; then
@@ -46,7 +57,7 @@ jobs:
         run: node scraper.mjs
         env:
           MAX_ROWS: 20
-          TZ: Europe/Paris   # utile pour logs; les timestamps restent en UTC
+          TZ: Europe/Paris   # pour les logs; tes timestamps restent en UTC
 
       - name: Upload artifacts
         if: steps.guard.outputs.run == 'true'
