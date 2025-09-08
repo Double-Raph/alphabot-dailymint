@@ -2,7 +2,8 @@ name: Daily Alphabot Scrape
 
 on:
   schedule:
-    - cron: "30 6 * * *"   # 06:30 UTC ~ 08:30 Paris (été)
+    # 00:00 et 01:00 UTC → couvre 02:00 Paris toute l'année (DST inclus)
+    - cron: "0 0,1 * * *"
   workflow_dispatch: {}
 
 permissions:
@@ -14,24 +15,41 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # ⛳️ Garde-fou : ne continuer que s'il est 02:00 en Europe/Paris
+      - name: Guard – run only at 02:00 Europe/Paris
+        id: guard
+        run: |
+          hour=$(TZ=Europe/Paris date +%H)
+          echo "Paris hour is $hour:00"
+          if [ "$hour" = "02" ]; then
+            echo "run=true" >> $GITHUB_OUTPUT
+          else
+            echo "run=false" >> $GITHUB_OUTPUT
+          fi
+
       - name: Setup Node
+        if: steps.guard.outputs.run == 'true'
         uses: actions/setup-node@v4
         with:
           node-version: 20
 
       - name: Install deps
+        if: steps.guard.outputs.run == 'true'
         run: npm install
 
       - name: Install Playwright browsers
+        if: steps.guard.outputs.run == 'true'
         run: npx playwright install --with-deps chromium
 
       - name: Scrape
+        if: steps.guard.outputs.run == 'true'
         run: node scraper.mjs
         env:
           MAX_ROWS: 20
+          TZ: Europe/Paris   # utile pour logs; les timestamps restent en UTC
 
-      - name: Upload artifacts (always)
-        if: always()
+      - name: Upload artifacts
+        if: steps.guard.outputs.run == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: alphabot-${{ github.run_id }}
