@@ -2,8 +2,8 @@ name: Daily Alphabot Scrape
 
 on:
   schedule:
-    # 00:00 et 01:00 UTC → couvre 02:00 Paris toute l'année (DST inclus)
-    - cron: "0 0,1 * * *"
+    # Toutes les 30 min de 00:00 à 02:30 UTC → couvre 02:00 Paris (été/hiver)
+    - cron: "0,30 0-2 * * *"
   workflow_dispatch:
     inputs:
       force:
@@ -17,11 +17,12 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
 
-      # ✅ Guard: n'exécute qu'à 02:00 Paris SAUF si force=true en manuel
-      - name: Guard – run only at 02:00 Europe/Paris (or force)
+      # Ne continue que si 02:00–02:09 Europe/Paris, ou si force=true
+      - name: Guard – run only 02:00 Europe/Paris (±9m) or force
         id: guard
         run: |
           force="${{ github.event.inputs.force }}"
@@ -31,8 +32,9 @@ jobs:
             exit 0
           fi
           hour=$(TZ=Europe/Paris date +%H)
-          echo "Paris hour is $hour:00"
-          if [ "$hour" = "02" ]; then
+          minute=$(TZ=Europe/Paris date +%M)
+          echo "Paris time is ${hour}:${minute}"
+          if [ "$hour" = "02" ] && [ "$minute" -lt 10 ]; then
             echo "run=true" >> $GITHUB_OUTPUT
           else
             echo "run=false" >> $GITHUB_OUTPUT
@@ -57,7 +59,7 @@ jobs:
         run: node scraper.mjs
         env:
           MAX_ROWS: 20
-          TZ: Europe/Paris   # pour les logs; tes timestamps restent en UTC
+          TZ: Europe/Paris  # pour les logs; tes epochs restent en UTC
 
       - name: Upload artifacts
         if: steps.guard.outputs.run == 'true'
@@ -65,3 +67,4 @@ jobs:
         with:
           name: alphabot-${{ github.run_id }}
           path: out/*
+
