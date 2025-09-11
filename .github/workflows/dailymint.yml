@@ -2,69 +2,70 @@ name: Daily Alphabot Scrape
 
 on:
   schedule:
-    # Toutes les 30 min de 00:00 à 02:30 UTC → couvre 02:00 Paris (été/hiver)
-    - cron: "0,30 0-2 * * *"
-  workflow_dispatch:
-    inputs:
-      force:
-        description: "Run now even if not 02:00 Europe/Paris?"
-        required: true
-        default: "false"
+    # 00:00 et 01:00 UTC → couvre 02:00 Paris toute l'année (DST)
+    - cron: "0 0,1 * * *"
+  workflow_dispatch: {}   # pour lancer à la main si besoin
 
 permissions:
   contents: write
 
+# annule un run si un nouveau démarre (évite chevauchement)
+concurrency:
+  group: alphabot-daily
+  cancel-in-progress: true
+
 jobs:
   run:
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
 
-      # Ne continue que si 02:00–02:09 Europe/Paris, ou si force=true
-      - name: Guard – run only 02:00 Europe/Paris (±9m) or force
-        id: guard
-        run: |
-          force="${{ github.event.inputs.force }}"
-          if [ "$force" = "true" ]; then
-            echo "Manual override: forcing run."
-            echo "run=true" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-          hour=$(TZ=Europe/Paris date +%H)
-          minute=$(TZ=Europe/Paris date +%M)
-          echo "Paris time is ${hour}:${minute}"
-          if [ "$hour" = "02" ] && [ "$minute" -lt 10 ]; then
-            echo "run=true" >> $GITHUB_OUTPUT
-          else
-            echo "run=false" >> $GITHUB_OUTPUT
-          fi
+      # --- run-lock: empêche un 2e run le même jour (Paris) ---
+      - name: Compute Paris date
+        id: time
+        run: echo "paris_date=$(TZ=Europe/Paris date +%F)" >> $GITHUB_OUTPUT
 
+      - name: Check run-lock
+        id: lock
+        uses: actions/cache/restore@v4
+        with:
+          key: alphabot-runlock-${{ steps.time.outputs.paris_date }}
+          path: .runlock
+          restore-keys: |
+            alphabot-runlock-
+
+      # Toutes les étapes suivantes s'exécutent sauf si déjà fait aujourd'hui
       - name: Setup Node
-        if: steps.guard.outputs.run == 'true'
+        if: steps.lock.outputs.cache-hit != 'true'
         uses: actions/setup-node@v4
         with:
           node-version: 20
 
       - name: Install deps
-        if: steps.guard.outputs.run == 'true'
+        if: steps.lock.outputs.cache-hit != 'true'
         run: npm install
 
       - name: Install Playwright browsers
-        if: steps.guard.outputs.run == 'true'
+        if: steps.lock.outputs.cache-hit != 'true'
         run: npx playwright install --with-deps chromium
 
       - name: Scrape
-        if: steps.guard.outputs.run == 'true'
+        if: steps.lock.outputs.cache-hit != 'true'
         run: node scraper.mjs
         env:
           MAX_ROWS: 20
-          TZ: Europe/Paris  # pour les logs; tes epochs restent en UTC
+          TZ: Europe/Paris   # juste pour les logs
 
       - name: Upload artifacts
-        if: steps.guard.outputs.run == 'true'
+        if: steps.lock.outputs.cache-hit != 'true'
         uses: actions/upload-artifact@v4
         with:
           name: alphabot-${{ github.run_id }}
           path: out/*
 
+      - name: Save run-lock (mark done for today)
+        if: steps.lock.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          key: alphabot-runlock-${{ steps.time.outputs.paris_date }}
+          path: .runlock
