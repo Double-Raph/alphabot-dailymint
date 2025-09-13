@@ -2,7 +2,7 @@ name: Daily Alphabot Scrape
 
 on:
   schedule:
-    # 00:00 et 01:00 UTC → couvre 02:00 Paris toute l'année (DST)
+    # 03:00 et 05:00 UTC → couvre 02:00 Paris toute l'année (DST)
     - cron: "0 0,1 * * *"
   workflow_dispatch: {}   # pour lancer à la main si besoin
 
