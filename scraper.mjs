@@ -1,4 +1,4 @@
-// scraper.mjs — v4.2 (heures = tooltip MINT, fallback +H, filtre fenêtre glissante, debug)
+// scraper.mjs — v4.3 (mapping fallback, textContent fallback, fenêtre glissante, debug)
 import { chromium } from "playwright";
 import fs from "fs";
 import path from "path";
@@ -28,43 +28,30 @@ function parseDateTextToUnix(text) {
   if (!text) return null;
   const t = text.trim();
 
-  // cas 1: parsable natif (ISO, "Sep 13 2025 14:17 UTC", etc.)
   const iso = Date.parse(t);
   if (!Number.isNaN(iso)) return Math.floor(iso / 1000);
 
-  // cas 2: "HH:MM UTC" (jour = aujourd'hui en UTC)
   let m = t.match(/(\d{1,2}):(\d{2})\s*UTC/i);
   if (m) {
     const now = new Date();
-    return Math.floor(
-      Date.UTC(
-        now.getUTCFullYear(),
-        now.getUTCMonth(),
-        now.getUTCDate(),
-        Number(m[1]),
-        Number(m[2]),
-        0
-      ) / 1000
-    );
+    return Math.floor(Date.UTC(
+      now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(),
+      Number(m[1]), Number(m[2]), 0
+    ) / 1000);
   }
 
-  // cas 3: "DD/MM/YYYY HH:MM" (interprété en UTC)
   m = t.match(/(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{2,4})\s+(\d{1,2}):(\d{2})/);
   if (m) {
-    const dd = Number(m[1]),
-      mm = Number(m[2]),
-      yyyy = Number(m[3].length === 2 ? "20" + m[3] : m[3]),
-      HH = Number(m[4]),
-      MM = Number(m[5]);
+    const dd = Number(m[1]), mm = Number(m[2]),
+          yyyy = Number(m[3].length === 2 ? "20" + m[3] : m[3]),
+          HH = Number(m[4]), MM = Number(m[5]);
     return Math.floor(Date.UTC(yyyy, mm - 1, dd, HH, MM, 0) / 1000);
   }
-
   return null;
 }
 
 async function readAbsoluteMintUnixFromCell(page, cell) {
-  // 1) Attributs sur la cellule ou son enfant
-  const attrs = ["title", "aria-label", "data-title", "data-tooltip", "data-original-title", "data-tippy-content"];
+  const attrs = ["title","aria-label","data-title","data-tooltip","data-original-title","data-tippy-content"];
   for (const a of attrs) {
     const v = await cell.getAttribute(a);
     const unix = parseDateTextToUnix(v);
@@ -79,7 +66,6 @@ async function readAbsoluteMintUnixFromCell(page, cell) {
     }
   }
 
-  // 2) Hover → tooltip/popover
   try {
     await cell.hover({ force: true });
     await page.waitForTimeout(450);
@@ -92,25 +78,12 @@ async function readAbsoluteMintUnixFromCell(page, cell) {
       if (unix) return unix;
     }
   } catch {}
-
-  return null; // pas trouvé
+  return null;
 }
 
-// Optionnel : calcul "début de journée" pour un fuseau donné
-function startOfDayUnixInTZ(date, tz = "Europe/Paris") {
-  const fmt = new Intl.DateTimeFormat("en-GB", {
-    timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit",
-    hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false
-  });
-  const parts = fmt.formatToParts(date).reduce((acc, p) => {
-    if (p.type !== "literal") acc[p.type] = p.value;
-    return acc;
-  }, {});
-  return Math.floor(Date.UTC(
-    Number(parts.year),
-    Number(parts.month) - 1,
-    Number(parts.day), 0, 0, 0
-  ) / 1000);
+// Debug helper
+function appendDebug(line) {
+  fs.appendFileSync(path.join(OUT_DIR, "debug.log"), line + "\n");
 }
 
 const todayUTC = new Date();
@@ -118,13 +91,14 @@ const stamp = `${todayUTC.getUTCFullYear()}${String(todayUTC.getUTCMonth()+1).pa
 
 async function main() {
   fs.mkdirSync(OUT_DIR, { recursive: true });
+  fs.writeFileSync(path.join(OUT_DIR, "debug.log"), "", "utf-8");
 
   const browser = await chromium.launch({
     headless: true,
     args: ["--no-sandbox", "--disable-dev-shm-usage"]
   });
   const context = await browser.newContext({
-    viewport: { width: 1366, height: 1700 },
+    viewport: { width: 1400, height: 1700 },
     userAgent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari",
     locale: "en-US"
   });
@@ -132,13 +106,12 @@ async function main() {
   page.setDefaultNavigationTimeout(120000);
   page.setDefaultTimeout(60000);
 
-  // 1) Navigation tolérante
   try { await page.goto(URL, { waitUntil: "domcontentloaded", timeout: 90000 }); }
-  catch (e) { console.warn("goto warning:", e.message); }
+  catch (e) { appendDebug("goto warning: " + e.message); }
   await page.waitForLoadState("networkidle", { timeout: 20000 }).catch(()=>{});
   await page.waitForSelector("table, [role='rowgroup']", { timeout: 45000 });
 
-  // 2) Lire l’en-tête pour trouver les colonnes
+  // 1) En-tête → mapping colonnes + fallback si besoin
   const headerTexts = await page.evaluate(() => {
     const texts = [];
     document.querySelectorAll("table thead tr th").forEach(th => texts.push((th.textContent||"").trim().toUpperCase()));
@@ -147,54 +120,77 @@ async function main() {
     }
     return texts;
   });
+  appendDebug("HeaderTexts: " + JSON.stringify(headerTexts));
+
   const WANT = ["NAME","MINT","CHAIN","SUPPLY","PUBLIC"];
   const idx = {};
   for (const k of WANT) idx[k] = headerTexts.findIndex(t => t.startsWith(k));
 
-  // 3) Lignes
-  let rows = await page.$$("table tbody tr");
-  if (rows.length === 0) rows = await page.$$("[role='rowgroup'] [role='row']");
-  const take = Math.min(rows.length, MAX_ROWS);
-  console.log("Rows detected:", rows.length, "→ processing first", take);
+  // Fallback index si non trouvé
+  const fallbackIdx = { NAME: 0, MINT: 1, CHAIN: 2, SUPPLY: 3, PUBLIC: 5 };
+  for (const k of WANT) {
+    if (idx[k] === -1) {
+      idx[k] = fallbackIdx[k];
+      appendDebug(`Fallback idx[${k}] -> ${idx[k]}`);
+    }
+  }
+  appendDebug("Final idx: " + JSON.stringify(idx));
 
+  // 2) Lignes
+  let rows = await page.$$(":is(table tbody tr, [role='rowgroup'] [role='row'])");
+  appendDebug(`Rows detected: ${rows.length}`);
+  if (rows.length === 0) {
+    // Capture directe et stop
+    await page.screenshot({ path: path.join(OUT_DIR, "empty.png"), fullPage: true });
+    fs.writeFileSync(path.join(OUT_DIR, "page.html"), await page.content(), "utf-8");
+    throw new Error("No rows detected");
+  }
+
+  const take = Math.min(rows.length, MAX_ROWS);
   const items = [];
 
   for (let i = 0; i < take; i++) {
     const row = rows[i];
 
-    let cells = await row.$$("td");
-    if (cells.length === 0) cells = await row.$$("[role='cell']");
+    let cells = await row.$$("td, [role='cell']");
+    if (!cells || cells.length === 0) {
+      appendDebug(`[row ${i}] no cells`);
+      continue;
+    }
 
-    const cellText = async (k) => {
-      const j = idx[k];
+    const readCell = async (j) => {
       if (j < 0 || j >= cells.length) return "";
-      return (await cells[j].innerText()).trim();
+      try {
+        const t = await cells[j].innerText();
+        if (t && t.trim()) return t.trim();
+      } catch {}
+      try {
+        return (await cells[j].evaluate(n => n.textContent || "")).trim();
+      } catch { return ""; }
     };
 
-    const name   = await cellText("NAME");
-    const mint   = await cellText("MINT");
-    const chain  = await cellText("CHAIN");
-    const supply = await cellText("SUPPLY");
-    const pub    = await cellText("PUBLIC");
+    const name   = await readCell(idx.NAME);
+    const mint   = await readCell(idx.MINT);
+    const chain  = await readCell(idx.CHAIN);
+    const supply = await readCell(idx.SUPPLY);
+    const pub    = await readCell(idx.PUBLIC);
 
-    // 4) HOVER sur la cellule "NAME" pour ouvrir la popover, puis récupérer le lien X/Twitter
+    appendDebug(`[row ${i}] name="${name}" mint="${mint}" chain="${chain}" supply="${supply}" public="${pub}"`);
+
+    // 3) Twitter (hover popover puis fallback clic)
     let twitterUrl = null;
     try {
-      const jName = idx["NAME"];
-      if (jName >= 0 && jName < cells.length) {
-        const nameCell = cells[jName];
-
+      const nameCell = cells[idx.NAME];
+      if (nameCell) {
         const anchor = await nameCell.$("a, [role='link'], span");
         if (anchor) {
           try { await anchor.scrollIntoViewIfNeeded?.(); } catch {}
           const box = await anchor.boundingBox();
-          if (box) {
-            await page.mouse.move(box.x + box.width/2, box.y + Math.min(10, box.height/2));
-          }
+          if (box) await page.mouse.move(box.x + box.width/2, box.y + Math.min(10, box.height/2));
           await anchor.hover({ force: true });
           await page.waitForTimeout(600);
 
-          const candidateSelectors = [
+          const sel = [
             "[role='dialog'] a[href*='x.com']",
             "[role='dialog'] a[href*='twitter.com']",
             "[role='tooltip'] a[href*='x.com']",
@@ -207,53 +203,39 @@ async function main() {
             "[class*='tooltip'] a[href*='twitter.com']",
             "[class*='card'] a[href*='x.com']",
             "[class*='card'] a[href*='twitter.com']"
-          ];
-          const links = await page.$$(candidateSelectors.join(","));
+          ].join(",");
+          const links = await page.$$(sel);
           for (const a of links) {
             const href = await a.getAttribute("href");
-            if (href && !/alphabotapp/i.test(href) && !/intent|share/i.test(href)) {
-              twitterUrl = href;
-              break;
-            }
+            if (href && !/alphabotapp/i.test(href) && !/intent|share/i.test(href)) { twitterUrl = href; break; }
           }
         }
       }
-
-      // Fallback : clic si le hover n'a rien donné
       if (!twitterUrl) {
         await row.click({ delay: 60 });
         await page.waitForTimeout(600);
         const links = await page.$$(
           "[role='dialog'] a[href*='x.com'], [role='dialog'] a[href*='twitter.com'], " +
-          "[class*='modal'] a[href*='x.com'], [class*='modal'] a[href*='twitter.com'], " +
-          "a[href*='x.com'], a[href*='twitter.com']"
+          "[class*='modal'] a[href*='x.com'], [class*='modal'] a[href*='twitter.com'], a[href*='x.com'], a[href*='twitter.com']"
         );
         for (const a of links) {
           const href = await a.getAttribute("href");
-          if (href && !/alphabotapp/i.test(href) && !/intent|share/i.test(href)) {
-            twitterUrl = href;
-            break;
-          }
+          if (href && !/alphabotapp/i.test(href) && !/intent|share/i.test(href)) { twitterUrl = href; break; }
         }
         await page.keyboard.press("Escape").catch(()=>{});
         await page.mouse.click(10, 10).catch(()=>{});
         await page.waitForTimeout(150);
       }
-    } catch {
-      // ignore si pas de popover
-    }
+    } catch {}
 
-    // ----- Heures : d'abord tooltip MINT, sinon fallback +H -----
+    // 4) Heures : tooltip MINT → fallback +H
     const now = new Date();
     const scraped_at_unix = Math.floor(now.getTime() / 1000);
 
     let event_unix_utc = null;
     try {
-      const jMint = idx["MINT"];
-      if (jMint >= 0 && jMint < cells.length) {
-        const mintCell = cells[jMint];
-        event_unix_utc = await readAbsoluteMintUnixFromCell(page, mintCell);
-      }
+      const mintCell = cells[idx.MINT];
+      if (mintCell) event_unix_utc = await readAbsoluteMintUnixFromCell(page, mintCell);
     } catch {}
 
     if (!event_unix_utc) {
@@ -262,35 +244,33 @@ async function main() {
       if (ahead) {
         event_unix_utc = scraped_at_unix + Number(ahead[1]) * 3600;
       } else if (ago) {
-        console.log(`[skip-ago] ${name} mint=${mint}`);
-        continue; // déjà passé
+        appendDebug(`[skip-ago] ${name} mint="${mint}"`);
+        continue;
       } else {
-        console.log(`[skip-format] ${name} mint=${mint}`);
-        continue; // ex: "2D" → ignore
+        appendDebug(`[skip-format] ${name} mint="${mint}"`);
+        continue; // "2D", "-", etc.
       }
     }
 
-    // ----- Filtre : fenêtre glissante OU "aujourd'hui" dans un TZ si DAY_TZ est défini -----
+    // 5) Filtre : fenêtre glissante (ou jour TZ si DAY_TZ est défini)
     let keep = true;
     const DAY_TZ = process.env.DAY_TZ;
     if (DAY_TZ) {
       const dayStart = startOfDayUnixInTZ(now, DAY_TZ);
-      const dayEnd   = dayStart + 86400;
+      const dayEnd = dayStart + 86400;
       keep = event_unix_utc >= dayStart && event_unix_utc < dayEnd;
-      if (!keep) console.log(`[skip-dayTZ] ${name} ${event_unix_utc} not in ${DAY_TZ} today`);
+      if (!keep) appendDebug(`[skip-dayTZ] ${name} ${event_unix_utc} not in ${DAY_TZ} today`);
     } else {
       const WINDOW_HOURS = Number(process.env.WINDOW_HOURS || 24);
       const windowStart = scraped_at_unix;
-      const windowEnd   = scraped_at_unix + WINDOW_HOURS * 3600;
+      const windowEnd = scraped_at_unix + WINDOW_HOURS * 3600;
       keep = event_unix_utc >= windowStart && event_unix_utc < windowEnd;
-      if (!keep) console.log(`[skip-window] ${name} mint=${mint} event=${event_unix_utc} not in +${WINDOW_HOURS}h`);
+      if (!keep) appendDebug(`[skip-window] ${name} event=${event_unix_utc} not in +${WINDOW_HOURS}h`);
     }
     if (!keep) continue;
 
-    // HH:MM en UTC (pour Twitter)
     const event_utc_hhmm = new Date(event_unix_utc * 1000).toISOString().slice(11, 16);
 
-    // ---- push final
     items.push({
       project: norm(name),
       mint_raw: norm(mint),
@@ -305,27 +285,19 @@ async function main() {
     });
   }
 
-  // 5) Sauvegarde JSON + CSV
+  // 6) Sauvegarde
   fs.mkdirSync(OUT_DIR, { recursive: true });
   const jsonPath = path.join(OUT_DIR, `alphabot_${stamp}.json`);
   fs.writeFileSync(jsonPath, JSON.stringify(items, null, 2), "utf-8");
 
   const header = [
-    "project",
-    "mint_raw",
-    "chain",
-    "supply",
-    "public_price_raw",
-    "twitter_handle",
-    "twitter_url",
-    "scraped_at_unix",
-    "event_unix_utc",
-    "event_utc_hhmm"
+    "project","mint_raw","chain","supply","public_price_raw",
+    "twitter_handle","twitter_url","scraped_at_unix","event_unix_utc","event_utc_hhmm"
   ];
   const csv = [
     header.join(","),
     ...items.map(x => header.map(k => {
-      const v = x[k] == null ? "" : String(x[k]).replace(/"/g, '""');
+      const v = x[k] == null ? "" : String(x[k]).replace(/"/g,'""');
       return /[,"\n]/.test(v) ? `"${v}"` : v;
     }).join(","))
   ].join("\n");
@@ -333,10 +305,9 @@ async function main() {
   fs.writeFileSync(csvPath, csv, "utf-8");
 
   if (items.length === 0) {
-    // Debug si aucun résultat : capture + HTML
     await page.screenshot({ path: path.join(OUT_DIR, "empty.png"), fullPage: true });
     fs.writeFileSync(path.join(OUT_DIR, "page.html"), await page.content(), "utf-8");
-    console.warn("No items kept. Wrote out/empty.png and out/page.html");
+    appendDebug("No items kept. Wrote out/empty.png and out/page.html");
   }
 
   console.log(`Saved: ${jsonPath}`);
@@ -348,4 +319,18 @@ main().catch(e => {
   console.error(e);
   process.exit(1);
 });
-// --- EOF ---
+
+// --- Utilitaires TZ (optionnel) ---
+function startOfDayUnixInTZ(date, tz = "Europe/Paris") {
+  const fmt = new Intl.DateTimeFormat("en-GB", {
+    timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false
+  });
+  const parts = fmt.formatToParts(date).reduce((acc, p) => {
+    if (p.type !== "literal") acc[p.type] = p.value;
+    return acc;
+  }, {});
+  return Math.floor(Date.UTC(
+    Number(parts.year), Number(parts.month) - 1, Number(parts.day), 0, 0, 0
+  ) / 1000);
+}
