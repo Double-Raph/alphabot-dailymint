@@ -251,14 +251,32 @@ async function main() {
       }
     }
 
-    // garde uniquement les mints du jour (UTC)
-    const startUTC = Math.floor(Date.UTC(
-      now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 0, 0, 0
-    ) / 1000);
-    const endUTC = startUTC + 86400;
-    if (!(event_unix_utc >= startUTC && event_unix_utc < endUTC)) {
-      continue;
-    }
+ // garde les mints dans une fenêtre glissante à partir de maintenant (par défaut 24h)
+function startOfDayUnixInTZ(date, tz = "Europe/Paris") {
+  const fmt = new Intl.DateTimeFormat("en-GB", {
+    timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false
+  });
+  // parts → {year, month, day}
+  const parts = fmt.formatToParts(date).reduce((acc, p) => {
+    if (p.type !== "literal") acc[p.type] = p.value;
+    return acc;
+  }, {});
+  // début de journée dans TZ converti en epoch UTC
+  return Math.floor(Date.UTC(
+    Number(parts.year),
+    Number(parts.month) - 1,
+    Number(parts.day), 0, 0, 0
+  ) / 1000);
+}
+
+const DAY_TZ = process.env.DAY_TZ || "Europe/Paris";
+const dayStart = startOfDayUnixInTZ(now, DAY_TZ);
+const dayEnd   = dayStart + 86400;
+if (!(event_unix_utc >= dayStart && event_unix_utc < dayEnd)) {
+  continue;
+}
+
 
     // HH:MM en UTC (pour Twitter)
     const event_utc_hhmm = new Date(event_unix_utc * 1000).toISOString().slice(11, 16);
