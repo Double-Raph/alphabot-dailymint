@@ -228,29 +228,70 @@ async function main() {
       }
     } catch {}
 
-    // 4) Heures : tooltip MINT → fallback +H
-    const now = new Date();
-    const scraped_at_unix = Math.floor(now.getTime() / 1000);
+    // ----- Heures : on privilégie le texte "M/H/D" de la cellule ; tooltip en dernier recours -----
+const now = new Date();
+const scraped_at_unix = Math.floor(now.getTime() / 1000);
 
-    let event_unix_utc = null;
-    try {
-      const mintCell = cells[idx.MINT];
-      if (mintCell) event_unix_utc = await readAbsoluteMintUnixFromCell(page, mintCell);
-    } catch {}
+const tMint = (mint || "").trim();
 
-    if (!event_unix_utc) {
-      const ahead = (mint || "").match(/^\s*(\d+)\s*H(?!\s*ago)\b/i);
-      const ago   = (mint || "").match(/^\s*(\d+)\s*H\s*ago\b/i);
-      if (ahead) {
-        event_unix_utc = scraped_at_unix + Number(ahead[1]) * 3600;
-      } else if (ago) {
-        appendDebug(`[skip-ago] ${name} mint="${mint}"`);
-        continue;
-      } else {
-        appendDebug(`[skip-format] ${name} mint="${mint}"`);
-        continue; // "2D", "-", etc.
-      }
+// 1) relative time: minutes / hours / days (non-"ago")
+const mAhead = tMint.match(/^\s*(\d+)\s*(?:M|MIN)\b(?!\s*ago)/i);
+const hAhead = tMint.match(/^\s*(\d+)\s*H\b(?!\s*ago)/i);
+const dAhead = tMint.match(/^\s*(\d+)\s*D\b(?!\s*ago)/i);
+
+// cas "ago" → on ignore
+const relAgo =
+  tMint.match(/^\s*(\d+)\s*(?:M|MIN)\s*ago\b/i) ||
+  tMint.match(/^\s*(\d+)\s*H\s*ago\b/i) ||
+  tMint.match(/^\s*(\d+)\s*D\s*ago\b/i);
+
+let event_unix_utc = null;
+
+if (relAgo) {
+  appendDebug(`[skip-ago] ${name} mint="${tMint}"`);
+  // déjà passé
+} else if (mAhead) {
+  event_unix_utc = scraped_at_unix + Number(mAhead[1]) * 60;
+} else if (hAhead) {
+  event_unix_utc = scraped_at_unix + Number(hAhead[1]) * 3600;
+} else if (dAhead) {
+  event_unix_utc = scraped_at_unix + Number(dAhead[1]) * 86400;
+} else {
+  // 2) pas de M/H/D → on tente de lire l’heure absolue dans le tooltip
+  try {
+    const jMint = idx["MINT"];
+    if (jMint >= 0 && jMint < cells.length) {
+      const mintCell = cells[jMint];
+      event_unix_utc = await readAbsoluteMintUnixFromCell(page, mintCell);
+      if (!event_unix_utc) appendDebug(`[no-abs-time] ${name} mint="${tMint}"`);
     }
+  } catch {}
+  if (!event_unix_utc) {
+    appendDebug(`[skip-format] ${name} mint="${tMint}"`);
+    continue; // ex: "-" ou format non géré
+  }
+}
+
+// ----- Filtre : fenêtre glissante OU "aujourd'hui" dans un TZ si DAY_TZ est défini -----
+let keep = true;
+const DAY_TZ = process.env.DAY_TZ;
+if (DAY_TZ) {
+  const dayStart = startOfDayUnixInTZ(now, DAY_TZ);
+  const dayEnd   = dayStart + 86400;
+  keep = event_unix_utc >= dayStart && event_unix_utc < dayEnd;
+  if (!keep) appendDebug(`[skip-dayTZ] ${name} ${event_unix_utc} not in ${DAY_TZ} today`);
+} else {
+  const WINDOW_HOURS = Number(process.env.WINDOW_HOURS || 24);
+  const windowStart = scraped_at_unix;
+  const windowEnd   = scraped_at_unix + WINDOW_HOURS * 3600;
+  keep = event_unix_utc >= windowStart && event_unix_utc < windowEnd;
+  if (!keep) appendDebug(`[skip-window] ${name} event=${event_unix_utc} not in +${WINDOW_HOURS}h`);
+}
+if (!keep) continue;
+
+// HH:MM en UTC (pour Twitter)
+const event_utc_hhmm = new Date(event_unix_utc * 1000).toISOString().slice(11, 16);
+
 
     // 5) Filtre : fenêtre glissante (ou jour TZ si DAY_TZ est défini)
     let keep = true;
