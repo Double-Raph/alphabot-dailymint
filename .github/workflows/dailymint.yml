@@ -16,9 +16,10 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-        env:
-      TZ: Europe/Paris
-      WINDOW_HOURS: 24
+  env:
+      TZ: "Europe/Paris"
+      WINDOW_HOURS: "24"   # fenêtre glissante pour filtrer les mints
+      
     steps:
       - uses: actions/checkout@v4
 
