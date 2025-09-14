@@ -1,4 +1,4 @@
-// scraper.mjs — v4 (hover popover + fallback click, 20 premières lignes)
+// scraper.mjs — v4.1 (heures = tooltip MINT, fallback +H, 20 premières lignes)
 import { chromium } from "playwright";
 import fs from "fs";
 import path from "path";
@@ -22,6 +22,80 @@ const handleFromUrl = (u) => {
     return h ? `@${h}` : null;
   } catch { return null; }
 };
+
+// ---- Helpers pour extraire l'heure absolue depuis la cellule MINT ----
+function parseDateTextToUnix(text) {
+  if (!text) return null;
+  const t = text.trim();
+
+  // cas 1: parsable natif (ISO, "Sep 13 2025 14:17 UTC", etc.)
+  const iso = Date.parse(t);
+  if (!Number.isNaN(iso)) return Math.floor(iso / 1000);
+
+  // cas 2: "HH:MM UTC" (jour = aujourd'hui en UTC)
+  let m = t.match(/(\d{1,2}):(\d{2})\s*UTC/i);
+  if (m) {
+    const now = new Date();
+    return Math.floor(
+      Date.UTC(
+        now.getUTCFullYear(),
+        now.getUTCMonth(),
+        now.getUTCDate(),
+        Number(m[1]),
+        Number(m[2]),
+        0
+      ) / 1000
+    );
+  }
+
+  // cas 3: "DD/MM/YYYY HH:MM" (interprété en UTC)
+  m = t.match(/(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{2,4})\s+(\d{1,2}):(\d{2})/);
+  if (m) {
+    const dd = Number(m[1]),
+      mm = Number(m[2]),
+      yyyy = Number(m[3].length === 2 ? "20" + m[3] : m[3]),
+      HH = Number(m[4]),
+      MM = Number(m[5]);
+    return Math.floor(Date.UTC(yyyy, mm - 1, dd, HH, MM, 0) / 1000);
+  }
+
+  return null;
+}
+
+async function readAbsoluteMintUnixFromCell(page, cell) {
+  // 1) Attributs sur la cellule ou son enfant
+  const attrs = ["title", "aria-label", "data-title", "data-tooltip", "data-original-title", "data-tippy-content"];
+  for (const a of attrs) {
+    const v = await cell.getAttribute(a);
+    const unix = parseDateTextToUnix(v);
+    if (unix) return unix;
+  }
+  const child = await cell.$("*");
+  if (child) {
+    for (const a of attrs) {
+      const v = await child.getAttribute(a);
+      const unix = parseDateTextToUnix(v);
+      if (unix) return unix;
+    }
+  }
+
+  // 2) Hover → tooltip/popover
+  try {
+    await cell.hover({ force: true });
+    await page.waitForTimeout(450);
+    const tip = page.locator(
+      "[role='tooltip'], [data-radix-popper-content-wrapper], [class*='tooltip'], [class*='popover'], [class*='balloon']"
+    ).last();
+    if (await tip.count()) {
+      const txt = (await tip.innerText()).trim();
+      const unix = parseDateTextToUnix(txt);
+      if (unix) return unix;
+    }
+  } catch {}
+
+  return null; // pas trouvé
+}
+
 const todayUTC = new Date();
 const stamp = `${todayUTC.getUTCFullYear()}${String(todayUTC.getUTCMonth()+1).padStart(2,"0")}${String(todayUTC.getUTCDate()).padStart(2,"0")}`;
 
@@ -93,19 +167,16 @@ async function main() {
       if (jName >= 0 && jName < cells.length) {
         const nameCell = cells[jName];
 
-        // ancre/élément cliquable dans la cellule
         const anchor = await nameCell.$("a, [role='link'], span");
         if (anchor) {
-          // s'assure que c'est à l'écran
           await anchor.scrollIntoViewIfNeeded?.().catch(()=>{});
           const box = await anchor.boundingBox();
           if (box) {
             await page.mouse.move(box.x + box.width/2, box.y + Math.min(10, box.height/2));
           }
           await anchor.hover({ force: true });
-          await page.waitForTimeout(600); // laisse la popover apparaître
+          await page.waitForTimeout(600);
 
-          // liens X/Twitter **dans** la popover/modale
           const candidateSelectors = [
             "[role='dialog'] a[href*='x.com']",
             "[role='dialog'] a[href*='twitter.com']",
@@ -131,7 +202,7 @@ async function main() {
         }
       }
 
-      // Fallback : clic sur la ligne si le hover n'a rien donné
+      // Fallback : clic si le hover n'a rien donné
       if (!twitterUrl) {
         await row.click({ delay: 60 });
         await page.waitForTimeout(600);
@@ -147,7 +218,6 @@ async function main() {
             break;
           }
         }
-        // ferme la modale/popover
         await page.keyboard.press("Escape").catch(()=>{});
         await page.mouse.click(10, 10).catch(()=>{});
         await page.waitForTimeout(150);
@@ -156,53 +226,56 @@ async function main() {
       // ignore si pas de popover
     }
 
-// --- timestamps & filtre "jour même" (UTC)
-const now = new Date();
-const scraped_at_unix = Math.floor(now.getTime() / 1000);
+    // ----- Heures : d'abord tooltip MINT, sinon fallback +H ; filtre "aujourd'hui" -----
+    const now = new Date();
+    const scraped_at_unix = Math.floor(now.getTime() / 1000);
 
-// "5H" à venir (PAS "H ago")
-const ahead = (mint || "").match(/^\s*(\d+)\s*H(?!\s*ago)\b/i);
-const ago   = (mint || "").match(/^\s*(\d+)\s*H\s*ago\b/i);
+    let event_unix_utc = null;
+    try {
+      const jMint = idx["MINT"];
+      if (jMint >= 0 && jMint < cells.length) {
+        const mintCell = cells[jMint];
+        event_unix_utc = await readAbsoluteMintUnixFromCell(page, mintCell);
+      }
+    } catch {}
 
-let event_unix_utc = null;
-if (ahead) {
-  event_unix_utc = scraped_at_unix + Number(ahead[1]) * 3600;
-} else if (ago) {
-  // déjà passé → on ignore cette ligne
-  continue;
-} else {
-  // formats non “H” (ex: "2D", "-", etc.) → on ignore
-  continue;
-}
+    if (!event_unix_utc) {
+      const ahead = (mint || "").match(/^\s*(\d+)\s*H(?!\s*ago)\b/i);
+      const ago   = (mint || "").match(/^\s*(\d+)\s*H\s*ago\b/i);
+      if (ahead) {
+        event_unix_utc = scraped_at_unix + Number(ahead[1]) * 3600;
+      } else if (ago) {
+        continue; // déjà passé
+      } else {
+        continue; // ex: "2D" → ignore
+      }
+    }
 
-// garde uniquement les mints du jour (UTC)
-const startUTC = Date.UTC(
-  now.getUTCFullYear(),
-  now.getUTCMonth(),
-  now.getUTCDate(),
-  0, 0, 0
-) / 1000;
-const endUTC = startUTC + 86400;
-if (!(event_unix_utc >= startUTC && event_unix_utc < endUTC)) {
-  continue;
-}
+    // garde uniquement les mints du jour (UTC)
+    const startUTC = Math.floor(Date.UTC(
+      now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 0, 0, 0
+    ) / 1000);
+    const endUTC = startUTC + 86400;
+    if (!(event_unix_utc >= startUTC && event_unix_utc < endUTC)) {
+      continue;
+    }
 
-// HH:MM en UTC (pour Twitter)
-const event_utc_hhmm = new Date(event_unix_utc * 1000).toISOString().slice(11, 16);
+    // HH:MM en UTC (pour Twitter)
+    const event_utc_hhmm = new Date(event_unix_utc * 1000).toISOString().slice(11, 16);
 
-// ---- push final
-items.push({
-  project: norm(name),
-  mint_raw: norm(mint),              // "4H", "9H", etc.
-  chain: norm(chain).toLowerCase(),  // eth, sol, base...
-  supply: supply ? digits(supply) : null,
-  public_price_raw: norm(pub),       // "Free", "0.011", etc.
-  twitter_handle: handleFromUrl(twitterUrl),
-  twitter_url: twitterUrl || "",
-  scraped_at_unix,
-  event_unix_utc,
-  event_utc_hhmm
-});
+    // ---- push final
+    items.push({
+      project: norm(name),
+      mint_raw: norm(mint),
+      chain: norm(chain).toLowerCase(),
+      supply: supply ? digits(supply) : null,
+      public_price_raw: norm(pub),
+      twitter_handle: handleFromUrl(twitterUrl),
+      twitter_url: twitterUrl || "",
+      scraped_at_unix,
+      event_unix_utc,
+      event_utc_hhmm
+    });
   }
 
   // 5) Sauvegarde JSON + CSV
@@ -210,17 +283,17 @@ items.push({
   fs.writeFileSync(jsonPath, JSON.stringify(items, null, 2), "utf-8");
 
   const header = [
-  "project",
-  "mint_raw",
-  "chain",
-  "supply",
-  "public_price_raw",
-  "twitter_handle",
-  "twitter_url",
-  "scraped_at_unix",
-  "event_unix_utc",
-  "event_utc_hhmm"
-];
+    "project",
+    "mint_raw",
+    "chain",
+    "supply",
+    "public_price_raw",
+    "twitter_handle",
+    "twitter_url",
+    "scraped_at_unix",
+    "event_unix_utc",
+    "event_utc_hhmm"
+  ];
   const csv = [
     header.join(","),
     ...items.map(x => header.map(k => {
