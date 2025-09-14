@@ -1,4 +1,4 @@
-// scraper.mjs — v4.1 (heures = tooltip MINT, fallback +H, 20 premières lignes)
+// scraper.mjs — v4.2 (heures = tooltip MINT, fallback +H, filtre fenêtre glissante, debug)
 import { chromium } from "playwright";
 import fs from "fs";
 import path from "path";
@@ -96,6 +96,23 @@ async function readAbsoluteMintUnixFromCell(page, cell) {
   return null; // pas trouvé
 }
 
+// Optionnel : calcul "début de journée" pour un fuseau donné
+function startOfDayUnixInTZ(date, tz = "Europe/Paris") {
+  const fmt = new Intl.DateTimeFormat("en-GB", {
+    timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false
+  });
+  const parts = fmt.formatToParts(date).reduce((acc, p) => {
+    if (p.type !== "literal") acc[p.type] = p.value;
+    return acc;
+  }, {});
+  return Math.floor(Date.UTC(
+    Number(parts.year),
+    Number(parts.month) - 1,
+    Number(parts.day), 0, 0, 0
+  ) / 1000);
+}
+
 const todayUTC = new Date();
 const stamp = `${todayUTC.getUTCFullYear()}${String(todayUTC.getUTCMonth()+1).padStart(2,"0")}${String(todayUTC.getUTCDate()).padStart(2,"0")}`;
 
@@ -169,7 +186,7 @@ async function main() {
 
         const anchor = await nameCell.$("a, [role='link'], span");
         if (anchor) {
-          await anchor.scrollIntoViewIfNeeded?.().catch(()=>{});
+          try { await anchor.scrollIntoViewIfNeeded?.(); } catch {}
           const box = await anchor.boundingBox();
           if (box) {
             await page.mouse.move(box.x + box.width/2, box.y + Math.min(10, box.height/2));
@@ -226,7 +243,7 @@ async function main() {
       // ignore si pas de popover
     }
 
-    // ----- Heures : d'abord tooltip MINT, sinon fallback +H ; filtre "aujourd'hui" -----
+    // ----- Heures : d'abord tooltip MINT, sinon fallback +H -----
     const now = new Date();
     const scraped_at_unix = Math.floor(now.getTime() / 1000);
 
@@ -245,38 +262,30 @@ async function main() {
       if (ahead) {
         event_unix_utc = scraped_at_unix + Number(ahead[1]) * 3600;
       } else if (ago) {
+        console.log(`[skip-ago] ${name} mint=${mint}`);
         continue; // déjà passé
       } else {
+        console.log(`[skip-format] ${name} mint=${mint}`);
         continue; // ex: "2D" → ignore
       }
     }
 
- // garde les mints dans une fenêtre glissante à partir de maintenant (par défaut 24h)
-function startOfDayUnixInTZ(date, tz = "Europe/Paris") {
-  const fmt = new Intl.DateTimeFormat("en-GB", {
-    timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit",
-    hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false
-  });
-  // parts → {year, month, day}
-  const parts = fmt.formatToParts(date).reduce((acc, p) => {
-    if (p.type !== "literal") acc[p.type] = p.value;
-    return acc;
-  }, {});
-  // début de journée dans TZ converti en epoch UTC
-  return Math.floor(Date.UTC(
-    Number(parts.year),
-    Number(parts.month) - 1,
-    Number(parts.day), 0, 0, 0
-  ) / 1000);
-}
-
-const DAY_TZ = process.env.DAY_TZ || "Europe/Paris";
-const dayStart = startOfDayUnixInTZ(now, DAY_TZ);
-const dayEnd   = dayStart + 86400;
-if (!(event_unix_utc >= dayStart && event_unix_utc < dayEnd)) {
-  continue;
-}
-
+    // ----- Filtre : fenêtre glissante OU "aujourd'hui" dans un TZ si DAY_TZ est défini -----
+    let keep = true;
+    const DAY_TZ = process.env.DAY_TZ;
+    if (DAY_TZ) {
+      const dayStart = startOfDayUnixInTZ(now, DAY_TZ);
+      const dayEnd   = dayStart + 86400;
+      keep = event_unix_utc >= dayStart && event_unix_utc < dayEnd;
+      if (!keep) console.log(`[skip-dayTZ] ${name} ${event_unix_utc} not in ${DAY_TZ} today`);
+    } else {
+      const WINDOW_HOURS = Number(process.env.WINDOW_HOURS || 24);
+      const windowStart = scraped_at_unix;
+      const windowEnd   = scraped_at_unix + WINDOW_HOURS * 3600;
+      keep = event_unix_utc >= windowStart && event_unix_utc < windowEnd;
+      if (!keep) console.log(`[skip-window] ${name} mint=${mint} event=${event_unix_utc} not in +${WINDOW_HOURS}h`);
+    }
+    if (!keep) continue;
 
     // HH:MM en UTC (pour Twitter)
     const event_utc_hhmm = new Date(event_unix_utc * 1000).toISOString().slice(11, 16);
@@ -297,6 +306,7 @@ if (!(event_unix_utc >= dayStart && event_unix_utc < dayEnd)) {
   }
 
   // 5) Sauvegarde JSON + CSV
+  fs.mkdirSync(OUT_DIR, { recursive: true });
   const jsonPath = path.join(OUT_DIR, `alphabot_${stamp}.json`);
   fs.writeFileSync(jsonPath, JSON.stringify(items, null, 2), "utf-8");
 
@@ -315,12 +325,19 @@ if (!(event_unix_utc >= dayStart && event_unix_utc < dayEnd)) {
   const csv = [
     header.join(","),
     ...items.map(x => header.map(k => {
-      const v = x[k] == null ? "" : String(x[k]).replace(/"/g,'""');
+      const v = x[k] == null ? "" : String(x[k]).replace(/"/g, '""');
       return /[,"\n]/.test(v) ? `"${v}"` : v;
     }).join(","))
   ].join("\n");
   const csvPath = path.join(OUT_DIR, `alphabot_${stamp}.csv`);
   fs.writeFileSync(csvPath, csv, "utf-8");
+
+  if (items.length === 0) {
+    // Debug si aucun résultat : capture + HTML
+    await page.screenshot({ path: path.join(OUT_DIR, "empty.png"), fullPage: true });
+    fs.writeFileSync(path.join(OUT_DIR, "page.html"), await page.content(), "utf-8");
+    console.warn("No items kept. Wrote out/empty.png and out/page.html");
+  }
 
   console.log(`Saved: ${jsonPath}`);
   console.log(`Saved: ${csvPath}`);
