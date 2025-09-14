@@ -18,7 +18,8 @@ jobs:
     runs-on: ubuntu-latest
     env:
       TZ: "Europe/Paris"     # pour les logs
-      WINDOW_HOURS: "24"     # fenêtre glissante pour filtrer les mints
+      WINDOW_HOURS: "24"     # fenêtre glissante (ex. 24h). Laisse vide si tu veux DAY_TZ.
+      # DAY_TZ: "Europe/Paris"  # ⇦ décommente pour filtrer "aujourd'hui" dans ce fuseau
 
     steps:
       - uses: actions/checkout@v4
@@ -56,7 +57,7 @@ jobs:
         if: steps.lock.outputs.cache-hit != 'true'
         run: node scraper.mjs
         env:
-          MAX_ROWS: "20"      # laisse TZ & WINDOW_HOURS au niveau du job
+          MAX_ROWS: "20"      # TZ/WINDOW_HOURS/ DAY_TZ sont déjà au niveau du job
 
       - name: Upload artifacts
         if: steps.lock.outputs.cache-hit != 'true'
