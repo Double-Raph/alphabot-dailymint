@@ -2,13 +2,13 @@ name: Daily Alphabot Scrape
 
 on:
   schedule:
-    - cron: "0 3-4 * * *"   # 03:00, 04:00 UTC
-  workflow_dispatch: {}   # pour lancer à la main si besoin
+    - cron: "0 3-4 * * *"   # 03:00 et 04:00 UTC
+  workflow_dispatch: {}     # lancement manuel si besoin
 
 permissions:
   contents: write
 
-# annule un run si un nouveau démarre (évite chevauchement)
+# Evite les chevauchements
 concurrency:
   group: alphabot-daily
   cancel-in-progress: true
@@ -16,10 +16,10 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-  env:
-      TZ: "Europe/Paris"
-      WINDOW_HOURS: "24"   # fenêtre glissante pour filtrer les mints
-      
+    env:
+      TZ: "Europe/Paris"     # pour les logs
+      WINDOW_HOURS: "24"     # fenêtre glissante pour filtrer les mints
+
     steps:
       - uses: actions/checkout@v4
 
@@ -42,7 +42,7 @@ jobs:
         if: steps.lock.outputs.cache-hit != 'true'
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: "20"
 
       - name: Install deps
         if: steps.lock.outputs.cache-hit != 'true'
@@ -56,8 +56,7 @@ jobs:
         if: steps.lock.outputs.cache-hit != 'true'
         run: node scraper.mjs
         env:
-          MAX_ROWS: 20
-          TZ: Europe/Paris   # juste pour les logs
+          MAX_ROWS: "20"      # laisse TZ & WINDOW_HOURS au niveau du job
 
       - name: Upload artifacts
         if: steps.lock.outputs.cache-hit != 'true'
