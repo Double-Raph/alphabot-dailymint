@@ -2,17 +2,13 @@ name: Daily Alphabot Scrape
 
 on:
   schedule:
-    - cron: "0 3-4 * * *"   # 03:00 et 04:00 UTC
-  workflow_dispatch:
-    inputs:
-      force:
-        description: "Ignorer le run-lock et forcer l'exécution"
-        required: false
-        default: "false"
+    - cron: "0 3,4 * * *"   # 03:00 et 04:00 UTC tous les jours
+  workflow_dispatch: {}     # lancement manuel (toujours exécute)
 
 permissions:
   contents: write
 
+# Évite seulement les chevauchements (le run le plus récent annule l'ancien)
 concurrency:
   group: alphabot-daily
   cancel-in-progress: true
@@ -21,44 +17,25 @@ jobs:
   run:
     runs-on: ubuntu-latest
     env:
-      TZ: "Europe/Paris"
-      WINDOW_HOURS: "24"
-      # DAY_TZ: "Europe/Paris"  # décommente si tu préfères filtrer “aujourd'hui” en TZ
+      TZ: "Europe/Paris"     # pour les logs
+      WINDOW_HOURS: "24"     # fenêtre glissante (ex. 24h). Ou commente et mets DAY_TZ si tu préfères.
+      # DAY_TZ: "Europe/Paris"  # ⇦ décommente pour filtrer “aujourd'hui” en TZ
 
     steps:
       - uses: actions/checkout@v4
 
-      # --- run-lock ---
-      - name: Compute Paris date
-        id: time
-        run: echo "paris_date=$(TZ=Europe/Paris date +%F)" >> $GITHUB_OUTPUT
-
-      - name: Check run-lock
-        id: lock
-        uses: actions/cache/restore@v4
-        with:
-          key: alphabot-runlock-${{ steps.time.outputs.paris_date }}
-          path: .runlock
-          restore-keys: |
-            alphabot-runlock-
-
-      # exécuter si pas de cache, OU si lancement manuel, OU si force=true
       - name: Setup Node
-        if: steps.lock.outputs.cache-hit != 'true' || github.event_name == 'workflow_dispatch' || github.event.inputs.force == 'true'
         uses: actions/setup-node@v4
         with:
           node-version: "20"
 
       - name: Install deps
-        if: steps.lock.outputs.cache-hit != 'true' || github.event_name == 'workflow_dispatch' || github.event.inputs.force == 'true'
-        run: npm install
+        run: npm ci || npm install
 
       - name: Install Playwright browsers
-        if: steps.lock.outputs.cache-hit != 'true' || github.event_name == 'workflow_dispatch' || github.event.inputs.force == 'true'
         run: npx playwright install --with-deps chromium
 
       - name: Scrape
-        if: steps.lock.outputs.cache-hit != 'true' || github.event_name == 'workflow_dispatch' || github.event.inputs.force == 'true'
         run: node scraper.mjs
         env:
           MAX_ROWS: "20"
@@ -66,30 +43,15 @@ jobs:
       - name: List outputs
         if: always()
         run: |
-          echo "cache-hit = ${{ steps.lock.outputs.cache-hit }}"
+          echo "Contenu du dossier out/ :"
           ls -la out || true
-          test -f out/debug.log && tail -n 100 out/debug.log || true
+          echo "Dernières lignes du debug :"
+          test -f out/debug.log && tail -n 200 out/debug.log || true
 
       - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: alphabot-${{ github.run_id }}
-          path: |
-            out/*
+          path: out/*
           if-no-files-found: warn
-
-      # préparer le run-lock pour que la sauvegarde ne fail pas
-      - name: Prepare run-lock path
-        if: steps.lock.outputs.cache-hit != 'true' && github.event_name != 'workflow_dispatch' && github.event.inputs.force != 'true'
-        run: |
-          mkdir -p .runlock
-          echo "done_on=${{ steps.time.outputs.paris_date }} UTC" > .runlock/marker.txt
-          ls -la .runlock
-
-      - name: Save run-lock (mark done for today)
-        if: steps.lock.outputs.cache-hit != 'true' && github.event_name != 'workflow_dispatch' && github.event.inputs.force != 'true'
-        uses: actions/cache/save@v4
-        with:
-          key: alphabot-runlock-${{ steps.time.outputs.paris_date }}
-          path: .runlock
