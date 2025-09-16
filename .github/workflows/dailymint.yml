@@ -57,7 +57,7 @@ jobs:
         if: steps.lock.outputs.cache-hit != 'true'
         run: node scraper.mjs
         env:
-          MAX_ROWS: "20"      # TZ/WINDOW_HOURS/ DAY_TZ sont déjà au niveau du job
+          MAX_ROWS: "20"      # TZ/WINDOW_HOURS/DAY_TZ sont déjà au niveau du job
 
       - name: Upload artifacts
         if: steps.lock.outputs.cache-hit != 'true'
@@ -65,6 +65,14 @@ jobs:
         with:
           name: alphabot-${{ github.run_id }}
           path: out/*
+
+      # --- éviter "Cache save failed" : créer .runlock avec un fichier ---
+      - name: Prepare run-lock path
+        if: steps.lock.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p .runlock
+          echo "done_on=${{ steps.time.outputs.paris_date }} UTC" > .runlock/marker.txt
+          ls -la .runlock
 
       - name: Save run-lock (mark done for today)
         if: steps.lock.outputs.cache-hit != 'true'
