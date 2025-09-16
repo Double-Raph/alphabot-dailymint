@@ -1,4 +1,4 @@
-// scraper.mjs — v4.4 (minutes/heures/jours, mapping fallback, fenêtre glissante, debug)
+// scraper.mjs — v4.5 (arrondi HH:00 : minutes ≤30 → down, >30 → up)
 import { chromium } from "playwright";
 import fs from "fs";
 import path from "path";
@@ -7,7 +7,7 @@ const URL = "https://www.alphabot.app/projects";
 const MAX_ROWS = Number(process.env.MAX_ROWS || 20);
 const OUT_DIR = path.join(process.cwd(), "out");
 
-// ---------- Helpers généraux ----------
+// ---------- Helpers ----------
 const norm = (s) => (s ?? "").toString().trim();
 const digits = (s) => {
   const x = norm(s).replace(/[^\d]/g, "");
@@ -22,44 +22,40 @@ const handleFromUrl = (u) => {
     return h ? `@${h}` : null;
   } catch { return null; }
 };
-
 function appendDebug(line) {
   fs.appendFileSync(path.join(OUT_DIR, "debug.log"), line + "\n");
 }
 
-// ---------- Parsing d'heures absolues depuis tooltip ----------
+// Arrondi : minutes ≤30 → down, sinon up (UTC, secondes=0)
+function roundHourRule(unix) {
+  const mins = Math.floor((unix % 3600) / 60);
+  let base = unix - (unix % 3600); // top-of-hour
+  if (mins > 30) base += 3600;
+  return base;
+}
+
+// Parsing heures absolues depuis tooltip si besoin
 function parseDateTextToUnix(text) {
   if (!text) return null;
   const t = text.trim();
 
-  // ex: "2025-09-14T14:17:00Z", "Sep 14 2025 14:17 UTC"
   const iso = Date.parse(t);
   if (!Number.isNaN(iso)) return Math.floor(iso / 1000);
 
-  // "HH:MM UTC"
   let m = t.match(/(\d{1,2}):(\d{2})\s*UTC/i);
   if (m) {
     const now = new Date();
-    return Math.floor(
-      Date.UTC(
-        now.getUTCFullYear(),
-        now.getUTCMonth(),
-        now.getUTCDate(),
-        Number(m[1]),
-        Number(m[2]),
-        0
-      ) / 1000
-    );
+    return Math.floor(Date.UTC(
+      now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(),
+      Number(m[1]), Number(m[2]), 0
+    ) / 1000);
   }
 
-  // "DD/MM/YYYY HH:MM" ou "DD/MM/YY HH:MM" (interprété en UTC)
   m = t.match(/(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{2,4})\s+(\d{1,2}):(\d{2})/);
   if (m) {
-    const dd = Number(m[1]),
-      mm = Number(m[2]),
-      yyyy = Number(m[3].length === 2 ? "20" + m[3] : m[3]),
-      HH = Number(m[4]),
-      MM = Number(m[5]);
+    const dd = Number(m[1]), mm = Number(m[2]),
+          yyyy = Number(m[3].length === 2 ? "20" + m[3] : m[3]),
+          HH = Number(m[4]), MM = Number(m[5]);
     return Math.floor(Date.UTC(yyyy, mm - 1, dd, HH, MM, 0) / 1000);
   }
 
@@ -67,8 +63,7 @@ function parseDateTextToUnix(text) {
 }
 
 async function readAbsoluteMintUnixFromCell(page, cell) {
-  // Attributs usuels
-  const attrs = ["title", "aria-label", "data-title", "data-tooltip", "data-original-title", "data-tippy-content"];
+  const attrs = ["title","aria-label","data-title","data-tooltip","data-original-title","data-tippy-content"];
   for (const a of attrs) {
     const v = await cell.getAttribute(a);
     const unix = parseDateTextToUnix(v);
@@ -83,7 +78,6 @@ async function readAbsoluteMintUnixFromCell(page, cell) {
     }
   }
 
-  // Tooltip au survol
   try {
     await cell.hover({ force: true });
     await page.waitForTimeout(450);
@@ -99,32 +93,23 @@ async function readAbsoluteMintUnixFromCell(page, cell) {
   return null;
 }
 
-// Début de journée (pour filtre "jour TZ" optionnel)
 function startOfDayUnixInTZ(date, tz = "Europe/Paris") {
   const fmt = new Intl.DateTimeFormat("en-GB", {
-    timeZone: tz,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: false
+    timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false
   });
   const parts = fmt.formatToParts(date).reduce((acc, p) => {
     if (p.type !== "literal") acc[p.type] = p.value;
     return acc;
   }, {});
-  return Math.floor(
-    Date.UTC(Number(parts.year), Number(parts.month) - 1, Number(parts.day), 0, 0, 0) / 1000
-  );
+  return Math.floor(Date.UTC(
+    Number(parts.year), Number(parts.month) - 1, Number(parts.day), 0, 0, 0
+  ) / 1000);
 }
 
 // ---------- Main ----------
 const todayUTC = new Date();
-const stamp = `${todayUTC.getUTCFullYear()}${String(todayUTC.getUTCMonth() + 1).padStart(2, "0")}${String(
-  todayUTC.getUTCDate()
-).padStart(2, "0")}`;
+const stamp = `${todayUTC.getUTCFullYear()}${String(todayUTC.getUTCMonth()+1).padStart(2,"0")}${String(todayUTC.getUTCDate()).padStart(2,"0")}`;
 
 async function main() {
   fs.mkdirSync(OUT_DIR, { recursive: true });
@@ -136,53 +121,36 @@ async function main() {
   });
   const context = await browser.newContext({
     viewport: { width: 1400, height: 1700 },
-    userAgent:
-      "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari",
+    userAgent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari",
     locale: "en-US"
   });
   const page = await context.newPage();
   page.setDefaultNavigationTimeout(120000);
   page.setDefaultTimeout(60000);
 
-  // 1) Navigation tolérante
-  try {
-    await page.goto(URL, { waitUntil: "domcontentloaded", timeout: 90000 });
-  } catch (e) {
-    appendDebug("goto warning: " + e.message);
-  }
-  await page.waitForLoadState("networkidle", { timeout: 20000 }).catch(() => {});
+  try { await page.goto(URL, { waitUntil: "domcontentloaded", timeout: 90000 }); }
+  catch (e) { appendDebug("goto warning: " + e.message); }
+  await page.waitForLoadState("networkidle", { timeout: 20000 }).catch(()=>{});
   await page.waitForSelector("table, [role='rowgroup']", { timeout: 45000 });
 
-  // 2) Mapping colonnes (avec fallback d'index)
+  // Mapping colonnes (+ fallback)
   const headerTexts = await page.evaluate(() => {
     const texts = [];
-    document
-      .querySelectorAll("table thead tr th")
-      .forEach((th) => texts.push((th.textContent || "").trim().toUpperCase()));
+    document.querySelectorAll("table thead tr th").forEach(th => texts.push((th.textContent||"").trim().toUpperCase()));
     if (texts.length === 0) {
-      document
-        .querySelectorAll("[role='columnheader']")
-        .forEach((h) => texts.push((h.textContent || "").trim().toUpperCase()));
+      document.querySelectorAll("[role='columnheader']").forEach(h => texts.push((h.textContent||"").trim().toUpperCase()));
     }
     return texts;
   });
   appendDebug("HeaderTexts: " + JSON.stringify(headerTexts));
 
-  const WANT = ["NAME", "MINT", "CHAIN", "SUPPLY", "PUBLIC"];
+  const WANT = ["NAME","MINT","CHAIN","SUPPLY","PUBLIC"];
   const idx = {};
-  for (const k of WANT) idx[k] = headerTexts.findIndex((t) => t.startsWith(k));
-
-  // Fallbacks (structure typique alphabot)
-  const fallbackIdx = { NAME: 0, MINT: 1, CHAIN: 2, SUPPLY: 3, PUBLIC: 5 };
-  for (const k of WANT) {
-    if (idx[k] === -1) {
-      idx[k] = fallbackIdx[k];
-      appendDebug(`Fallback idx[${k}] -> ${idx[k]}`);
-    }
-  }
+  for (const k of WANT) idx[k] = headerTexts.findIndex(t => t.startsWith(k));
+  const fallbackIdx = { NAME:0, MINT:1, CHAIN:2, SUPPLY:3, PUBLIC:5 };
+  for (const k of WANT) if (idx[k] === -1) { idx[k] = fallbackIdx[k]; appendDebug(`Fallback idx[${k}] -> ${idx[k]}`); }
   appendDebug("Final idx: " + JSON.stringify(idx));
 
-  // 3) Lignes
   let rows = await page.$$(":is(table tbody tr, [role='rowgroup'] [role='row'])");
   appendDebug(`Rows detected: ${rows.length}`);
   if (rows.length === 0) {
@@ -196,47 +164,33 @@ async function main() {
 
   for (let i = 0; i < take; i++) {
     const row = rows[i];
-
     const cells = await row.$$("td, [role='cell']");
-    if (!cells || cells.length === 0) {
-      appendDebug(`[row ${i}] no cells`);
-      continue;
-    }
+    if (!cells || cells.length === 0) { appendDebug(`[row ${i}] no cells`); continue; }
 
-    // Lecture tolérante du texte d'une cellule
     const readCell = async (j) => {
       if (j < 0 || j >= cells.length) return "";
-      try {
-        const t = await cells[j].innerText();
-        if (t && t.trim()) return t.trim();
-      } catch {}
-      try {
-        return (await cells[j].evaluate((n) => n.textContent || "")).trim();
-      } catch {
-        return "";
-      }
+      try { const t = await cells[j].innerText(); if (t && t.trim()) return t.trim(); } catch {}
+      try { return (await cells[j].evaluate(n => n.textContent || "")).trim(); } catch { return ""; }
     };
 
-    const name = await readCell(idx.NAME);
-    const mint = await readCell(idx.MINT);
-    const chain = await readCell(idx.CHAIN);
+    const name   = await readCell(idx.NAME);
+    const mint   = await readCell(idx.MINT);
+    const chain  = await readCell(idx.CHAIN);
     const supply = await readCell(idx.SUPPLY);
-    const pub = await readCell(idx.PUBLIC);
+    const pub    = await readCell(idx.PUBLIC);
 
     appendDebug(`[row ${i}] name="${name}" mint="${mint}" chain="${chain}" supply="${supply}" public="${pub}"`);
 
-    // 4) Récup du lien X/Twitter (hover popover puis fallback clic)
+    // Twitter (hover popover, fallback clic)
     let twitterUrl = null;
     try {
       const nameCell = cells[idx.NAME];
       if (nameCell) {
         const anchor = await nameCell.$("a, [role='link'], span");
         if (anchor) {
-          try {
-            await anchor.scrollIntoViewIfNeeded?.();
-          } catch {}
+          try { await anchor.scrollIntoViewIfNeeded?.(); } catch {}
           const box = await anchor.boundingBox();
-          if (box) await page.mouse.move(box.x + box.width / 2, box.y + Math.min(10, box.height / 2));
+          if (box) await page.mouse.move(box.x + box.width/2, box.y + Math.min(10, box.height/2));
           await anchor.hover({ force: true });
           await page.waitForTimeout(600);
 
@@ -257,35 +211,28 @@ async function main() {
           const links = await page.$$(sel);
           for (const a of links) {
             const href = await a.getAttribute("href");
-            if (href && !/alphabotapp/i.test(href) && !/intent|share/i.test(href)) {
-              twitterUrl = href;
-              break;
-            }
+            if (href && !/alphabotapp/i.test(href) && !/intent|share/i.test(href)) { twitterUrl = href; break; }
           }
         }
       }
-
       if (!twitterUrl) {
         await row.click({ delay: 60 });
         await page.waitForTimeout(600);
         const links = await page.$$(
           "[role='dialog'] a[href*='x.com'], [role='dialog'] a[href*='twitter.com'], " +
-            "[class*='modal'] a[href*='x.com'], [class*='modal'] a[href*='twitter.com'], a[href*='x.com'], a[href*='twitter.com']"
+          "[class*='modal'] a[href*='x.com'], [class*='modal'] a[href*='twitter.com'], a[href*='x.com'], a[href*='twitter.com']"
         );
         for (const a of links) {
           const href = await a.getAttribute("href");
-          if (href && !/alphabotapp/i.test(href) && !/intent|share/i.test(href)) {
-            twitterUrl = href;
-            break;
-          }
+          if (href && !/alphabotapp/i.test(href) && !/intent|share/i.test(href)) { twitterUrl = href; break; }
         }
-        await page.keyboard.press("Escape").catch(() => {});
-        await page.mouse.click(10, 10).catch(() => {});
+        await page.keyboard.press("Escape").catch(()=>{});
+        await page.mouse.click(10, 10).catch(()=>{});
         await page.waitForTimeout(150);
       }
     } catch {}
 
-    // 5) Heures : on privilégie la valeur "M/H/D" de la cellule ; tooltip en dernier recours
+    // Heures : priorité au texte relatif M/H/D ; tooltip en dernier recours
     const now = new Date();
     const scraped_at_unix = Math.floor(now.getTime() / 1000);
     const tMint = (mint || "").trim();
@@ -303,7 +250,7 @@ async function main() {
 
     if (relAgo) {
       appendDebug(`[skip-ago] ${name} mint="${tMint}"`);
-      // on ignore (déjà passé)
+      // déjà passé
     } else if (mAhead) {
       event_unix_utc = scraped_at_unix + Number(mAhead[1]) * 60;
     } else if (hAhead) {
@@ -311,7 +258,6 @@ async function main() {
     } else if (dAhead) {
       event_unix_utc = scraped_at_unix + Number(dAhead[1]) * 86400;
     } else {
-      // Pas de M/H/D → tenter l'heure absolue depuis tooltip
       try {
         const mintCell = cells[idx.MINT];
         if (mintCell) {
@@ -319,13 +265,10 @@ async function main() {
           if (!event_unix_utc) appendDebug(`[no-abs-time] ${name} mint="${tMint}"`);
         }
       } catch {}
-      if (!event_unix_utc) {
-        appendDebug(`[skip-format] ${name} mint="${tMint}"`);
-        continue;
-      }
+      if (!event_unix_utc) { appendDebug(`[skip-format] ${name} mint="${tMint}"`); continue; }
     }
 
-    // 6) Filtre : fenêtre glissante (ou "jour TZ" si DAY_TZ défini)
+    // Filtre (fenêtre glissante ou "jour TZ")
     let keep = true;
     const DAY_TZ = process.env.DAY_TZ;
     if (DAY_TZ) {
@@ -342,10 +285,12 @@ async function main() {
     }
     if (!keep) continue;
 
-    // 7) HH:MM UTC pour Twitter
+    // Arrondis + formats
+    const event_unix_utc_rounded = roundHourRule(event_unix_utc);
     const event_utc_hhmm = new Date(event_unix_utc * 1000).toISOString().slice(11, 16);
+    const event_utc_hhmm_rounded = new Date(event_unix_utc_rounded * 1000).toISOString().slice(11, 16);
 
-    // 8) Push
+    // Push
     items.push({
       project: norm(name),
       mint_raw: norm(mint),
@@ -356,37 +301,27 @@ async function main() {
       twitter_url: twitterUrl || "",
       scraped_at_unix,
       event_unix_utc,
-      event_utc_hhmm
+      event_unix_utc_rounded,
+      event_utc_hhmm,
+      event_utc_hhmm_rounded
     });
   }
 
-  // 9) Sauvegarde JSON + CSV
+  // Sauvegarde JSON + CSV
   fs.mkdirSync(OUT_DIR, { recursive: true });
   const jsonPath = path.join(OUT_DIR, `alphabot_${stamp}.json`);
   fs.writeFileSync(jsonPath, JSON.stringify(items, null, 2), "utf-8");
 
   const header = [
-    "project",
-    "mint_raw",
-    "chain",
-    "supply",
-    "public_price_raw",
-    "twitter_handle",
-    "twitter_url",
-    "scraped_at_unix",
-    "event_unix_utc",
-    "event_utc_hhmm"
+    "project","mint_raw","chain","supply","public_price_raw","twitter_handle","twitter_url",
+    "scraped_at_unix","event_unix_utc","event_unix_utc_rounded","event_utc_hhmm","event_utc_hhmm_rounded"
   ];
   const csv = [
     header.join(","),
-    ...items.map((x) =>
-      header
-        .map((k) => {
-          const v = x[k] == null ? "" : String(x[k]).replace(/"/g, '""');
-          return /[,"\n]/.test(v) ? `"${v}"` : v;
-        })
-        .join(",")
-    )
+    ...items.map(x => header.map(k => {
+      const v = x[k] == null ? "" : String(x[k]).replace(/"/g,'""');
+      return /[,"\n]/.test(v) ? `"${v}"` : v;
+    }).join(","))
   ].join("\n");
   const csvPath = path.join(OUT_DIR, `alphabot_${stamp}.csv`);
   fs.writeFileSync(csvPath, csv, "utf-8");
@@ -402,7 +337,7 @@ async function main() {
   await browser.close();
 }
 
-main().catch((e) => {
+main().catch(e => {
   console.error(e);
   process.exit(1);
 });
