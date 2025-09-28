@@ -2,8 +2,8 @@ name: Daily Alphabot Scrape
 
 on:
   schedule:
-    - cron: "0 3-4 * * *"   # 03:00 et 04:00 UTC (2 fenêtres → couvre 02:00 Paris été/hiver)
-  workflow_dispatch: {}     # lancement manuel
+    - cron: "0 3-4 * * *"   # 03:00 & 04:00 UTC
+  workflow_dispatch: {}
 
 permissions:
   contents: write
@@ -15,15 +15,16 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 25           # ← avoid exit code 124
     env:
-      TZ: "Europe/Paris"        # pour les logs
-      DAY_TZ: "Europe/Paris"    # journée de référence pour le filtre
-      MAX_ROWS: "30"            # nb max de projets à traiter (pills du jour)
-      SCRAPE_TIMEOUT_MS: "360000" # 6 min hard timeout
+      TZ: "Europe/Paris"
+      WINDOW_HOURS: "24"
+      # DAY_TZ: "Europe/Paris"    # uncomment if you want “today” relative to Paris
+
     steps:
       - uses: actions/checkout@v4
 
-      # run-lock: 1 seul run / jour (Paris)
+      # run-lock so we don't run twice the same day (Paris date)
       - name: Compute Paris date
         id: time
         run: echo "paris_date=$(TZ=Europe/Paris date +%F)" >> $GITHUB_OUTPUT
@@ -45,22 +46,30 @@ jobs:
 
       - name: Install deps
         if: steps.lock.outputs.cache-hit != 'true'
-        run: npm install
+        run: npm ci
 
       - name: Install Playwright browsers
         if: steps.lock.outputs.cache-hit != 'true'
         run: npx playwright install --with-deps chromium
 
-      - name: Scrape (calendar)
+      - name: Scrape
         if: steps.lock.outputs.cache-hit != 'true'
         run: node scraper.mjs
+        env:
+          MAX_ROWS: "25"          # cap amount to click
+          CALENDAR_URL: "https://www.alphabot.app/calendar"
 
-      - name: Upload artifacts
-        if: steps.lock.outputs.cache-hit != 'true'
+      # upload *even on failure* so we can debug
+      - name: Upload artifacts (always)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: alphabot-${{ github.run_id }}
-          path: out/*
+          path: |
+            out/**
+            traces/**
+            playwright-*.png
+            debug.log
 
       - name: Save run-lock (mark done for today)
         if: steps.lock.outputs.cache-hit != 'true'
