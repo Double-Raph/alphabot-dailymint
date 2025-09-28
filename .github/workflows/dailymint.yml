@@ -43,9 +43,10 @@ jobs:
         with:
           node-version: "20"
 
+      # ⬇️ Fallback: essaie npm ci (si lockfile présent), sinon npm install
       - name: Install deps
         if: steps.lock.outputs.cache-hit != 'true'
-        run: npm ci
+        run: npm ci || npm install
 
       - name: Install Playwright browsers
         if: steps.lock.outputs.cache-hit != 'true'
@@ -56,10 +57,9 @@ jobs:
         env:
           MAX_ROWS: "25"
           CALENDAR_URL: "https://www.alphabot.app/calendar"
-          DEBUG: "pw:api"         # verbose Playwright logs in debug.log
+          DEBUG: "pw:api"
         run: node scraper.mjs
 
-      # Always create folders & placeholders so artifacts upload never says "no files"
       - name: Ensure artifacts folder (always)
         if: always()
         run: |
