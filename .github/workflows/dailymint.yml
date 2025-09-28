@@ -2,7 +2,7 @@ name: Daily Alphabot Scrape
 
 on:
   schedule:
-    - cron: "0 3-4 * * *"   # 03:00 & 04:00 UTC
+    - cron: "0 3-4 * * *"        # 03:00 & 04:00 UTC
   workflow_dispatch: {}
 
 permissions:
@@ -15,16 +15,15 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 25           # ← avoid exit code 124
+    timeout-minutes: 25
     env:
       TZ: "Europe/Paris"
       WINDOW_HOURS: "24"
-      # DAY_TZ: "Europe/Paris"    # uncomment if you want “today” relative to Paris
+      # DAY_TZ: "Europe/Paris"   # uncomment if you want “today” in Paris TZ
 
     steps:
       - uses: actions/checkout@v4
 
-      # run-lock so we don't run twice the same day (Paris date)
       - name: Compute Paris date
         id: time
         run: echo "paris_date=$(TZ=Europe/Paris date +%F)" >> $GITHUB_OUTPUT
@@ -54,12 +53,21 @@ jobs:
 
       - name: Scrape
         if: steps.lock.outputs.cache-hit != 'true'
-        run: node scraper.mjs
         env:
-          MAX_ROWS: "25"          # cap amount to click
+          MAX_ROWS: "25"
           CALENDAR_URL: "https://www.alphabot.app/calendar"
+          DEBUG: "pw:api"         # verbose Playwright logs in debug.log
+        run: node scraper.mjs
 
-      # upload *even on failure* so we can debug
+      # Always create folders & placeholders so artifacts upload never says "no files"
+      - name: Ensure artifacts folder (always)
+        if: always()
+        run: |
+          mkdir -p out traces
+          [ -f out/EMPTY.txt ] || echo "no data (failure or zero items)" > out/EMPTY.txt
+          [ -f traces/EMPTY.txt ] || echo "no trace" > traces/EMPTY.txt
+          [ -f debug.log ] || echo "no debug log" > debug.log
+
       - name: Upload artifacts (always)
         if: always()
         uses: actions/upload-artifact@v4
