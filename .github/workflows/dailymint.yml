@@ -2,13 +2,12 @@ name: Daily Alphabot Scrape
 
 on:
   schedule:
-    - cron: "0 3,4 * * *"   # 03:00 et 04:00 UTC tous les jours
-  workflow_dispatch: {}     # lancement manuel (toujours exécute)
+    - cron: "0 3-4 * * *"   # 03:00 et 04:00 UTC (2 fenêtres → couvre 02:00 Paris été/hiver)
+  workflow_dispatch: {}     # lancement manuel
 
 permissions:
   contents: write
 
-# Évite seulement les chevauchements (le run le plus récent annule l'ancien)
 concurrency:
   group: alphabot-daily
   cancel-in-progress: true
@@ -17,41 +16,55 @@ jobs:
   run:
     runs-on: ubuntu-latest
     env:
-      TZ: "Europe/Paris"     # pour les logs
-      WINDOW_HOURS: "24"     # fenêtre glissante (ex. 24h). Ou commente et mets DAY_TZ si tu préfères.
-      # DAY_TZ: "Europe/Paris"  # ⇦ décommente pour filtrer “aujourd'hui” en TZ
-
+      TZ: "Europe/Paris"        # pour les logs
+      DAY_TZ: "Europe/Paris"    # journée de référence pour le filtre
+      MAX_ROWS: "30"            # nb max de projets à traiter (pills du jour)
+      SCRAPE_TIMEOUT_MS: "360000" # 6 min hard timeout
     steps:
       - uses: actions/checkout@v4
 
+      # run-lock: 1 seul run / jour (Paris)
+      - name: Compute Paris date
+        id: time
+        run: echo "paris_date=$(TZ=Europe/Paris date +%F)" >> $GITHUB_OUTPUT
+
+      - name: Check run-lock
+        id: lock
+        uses: actions/cache/restore@v4
+        with:
+          key: alphabot-runlock-${{ steps.time.outputs.paris_date }}
+          path: .runlock
+          restore-keys: |
+            alphabot-runlock-
+
       - name: Setup Node
+        if: steps.lock.outputs.cache-hit != 'true'
         uses: actions/setup-node@v4
         with:
           node-version: "20"
 
       - name: Install deps
-        run: npm ci || npm install
+        if: steps.lock.outputs.cache-hit != 'true'
+        run: npm install
 
       - name: Install Playwright browsers
+        if: steps.lock.outputs.cache-hit != 'true'
         run: npx playwright install --with-deps chromium
 
-      - name: Scrape
+      - name: Scrape (calendar)
+        if: steps.lock.outputs.cache-hit != 'true'
         run: node scraper.mjs
-        env:
-          MAX_ROWS: "20"
-
-      - name: List outputs
-        if: always()
-        run: |
-          echo "Contenu du dossier out/ :"
-          ls -la out || true
-          echo "Dernières lignes du debug :"
-          test -f out/debug.log && tail -n 200 out/debug.log || true
 
       - name: Upload artifacts
-        if: always()
+        if: steps.lock.outputs.cache-hit != 'true'
         uses: actions/upload-artifact@v4
         with:
           name: alphabot-${{ github.run_id }}
           path: out/*
-          if-no-files-found: warn
+
+      - name: Save run-lock (mark done for today)
+        if: steps.lock.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          key: alphabot-runlock-${{ steps.time.outputs.paris_date }}
+          path: .runlock
