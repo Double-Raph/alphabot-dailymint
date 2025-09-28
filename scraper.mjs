@@ -1,259 +1,275 @@
-// scraper.mjs — calendar scraping with retries + guaranteed artifacts
+// scraper.mjs — Calendar scraper (alphabot.app/calendar)
+// Node >= 18, Playwright ^1.47
+// Sorties: out/alphabot_YYYYMMDD.json + .csv
+// DEBUG: traces + screenshots si souci
+
 import { chromium } from "playwright";
 import fs from "fs";
 import path from "path";
 
-const URL = process.env.CALENDAR_URL || "https://www.alphabot.app/calendar";
-const MAX_ROWS = Number(process.env.MAX_ROWS || 20);
+const CAL_URL  = "https://www.alphabot.app/calendar";
+const OUT_DIR  = path.join(process.cwd(), "out");
+const MAX_ROWS = Number(process.env.MAX_ROWS || 30);
 
-const OUT_DIR   = path.join(process.cwd(), "out");
-const TRACE_DIR = path.join(process.cwd(), "traces");
-fs.mkdirSync(OUT_DIR, { recursive: true });
-fs.mkdirSync(TRACE_DIR, { recursive: true });
-
-function logDebug(...args) {
-  fs.appendFileSync("debug.log", args.join(" ") + "\n");
-}
-
+// ---------- utils ----------
 const norm = (s) => (s ?? "").toString().trim();
+
 const digits = (s) => {
   const x = norm(s).replace(/[^\d]/g, "");
   return x ? Number(x) : null;
 };
-const handleFromUrl = (u) => {
+
+function handleFromUrl(u) {
   if (!u) return null;
   try {
     const url = new URL(u);
     if (!/x\.com|twitter\.com/i.test(url.hostname)) return null;
     const h = url.pathname.replace(/\//g, "").trim();
     return h ? `@${h}` : null;
-  } catch { return null; }
-};
+  } catch {
+    return null;
+  }
+}
 
-const nowUTC = new Date();
-const stamp = `${nowUTC.getUTCFullYear()}${String(nowUTC.getUTCMonth()+1).padStart(2,"0")}${String(nowUTC.getUTCDate()).padStart(2,"0")}`;
+const todayUTC = new Date();
+const stamp = `${todayUTC.getUTCFullYear()}${String(todayUTC.getUTCMonth() + 1).padStart(2, "0")}${String(todayUTC.getUTCDate()).padStart(2, "0")}`;
 
-async function gotoWithRetry(page, url, tries = 4) {
-  let lastErr;
-  for (let i = 1; i <= tries; i++) {
-    try {
-      const resp = await page.goto(url, { waitUntil: "domcontentloaded", timeout: 90_000 });
-      if (resp && !resp.ok()) throw new Error(`HTTP ${resp.status()} at ${url}`);
-      await page.waitForLoadState("networkidle", { timeout: 20_000 }).catch(()=>{});
-      // don’t be strict: any big calendar container or FILTER button will do
-      await page.waitForSelector('text=/FILTER/i, [role="grid"], [class*="Calendar"], [class*="calendar"]', { timeout: 30_000 });
-      return;
-    } catch (e) {
-      lastErr = e;
-      logDebug(`[goto retry ${i}] ${e.message}`);
-      try { await page.screenshot({ path: `playwright-goto-${i}.png`, fullPage: true }); } catch {}
-      await page.waitForTimeout(2000 * i);
+function logDebug(msg) {
+  fs.appendFileSync(path.join(OUT_DIR, "debug.log"), `[${new Date().toISOString()}] ${msg}\n`);
+}
+
+// Attendre "l'un OU l'autre"
+async function waitForAny(page, waiters, overallTimeoutMs = 15000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), overallTimeoutMs);
+  const wrapped = waiters.map(w => w().catch(() => new Promise(() => {})));
+  try {
+    await Promise.race(wrapped);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Aller/attendre la page
+async function gotoCalendar(page) {
+  await page.goto(CAL_URL, { waitUntil: "domcontentloaded", timeout: 90000 }).catch(()=>{});
+  await page.waitForLoadState("networkidle", { timeout: 10000 }).catch(()=>{});
+
+  const calendarSelectors = '[role="grid"], [class*="Calendar"], [class*="calendar"]';
+  await waitForAny(page, [
+    () => page.locator("text=FILTER").first().waitFor({ state: "visible", timeout: 6000 }),
+    () => page.locator(calendarSelectors).first().waitFor({ state: "visible", timeout: 6000 }),
+  ], 18000);
+}
+
+// Trouver la case "Today" ou celle correspondant à la date du jour
+async function findTodayCell(page) {
+  // 1) essai direct "Today"
+  const byToday = page.locator("text=/^\\s*Today\\s*$/i").first();
+  if (await byToday.count().catch(()=>0)) {
+    // remonte à la cellule parent (case calendrier)
+    const cell = await byToday.locator("xpath=ancestor::*[self::*[contains(@role,'gridcell')] or self::*[contains(@class,'day')] or self::*[contains(@class,'cell')]][1]").first();
+    if (await cell.count().catch(()=>0)) return cell;
+  }
+
+  // 2) fallback: repérer un gridcell avec aria-selected=true
+  const selected = page.locator('[role="gridcell"][aria-selected="true"]').first();
+  if (await selected.count().catch(()=>0)) return selected;
+
+  // 3) fallback: jour numérique
+  const d = new Date();
+  const dd = String(d.getDate());
+  // un chiffre en haut à gauche de la case
+  const anyCell = page.locator(`[role="gridcell"]:has-text("${dd}")`).first();
+  if (await anyCell.count().catch(()=>0)) return anyCell;
+
+  // 4) dernier fallback: toute case visible du calendrier
+  const any = page.locator('[role="gridcell"]').first();
+  if (await any.count().catch(()=>0)) return any;
+
+  return null;
+}
+
+// Extraire infos depuis la popover/modale
+async function readFromPopover(page) {
+  // la popover peut être: [role=dialog], [data-radix-popper-content-wrapper], etc.
+  const card = page.locator(
+    "[role='dialog'], [data-radix-popper-content-wrapper], [class*='popover'], [class*='TooltipContent'], [class*='card']"
+  ).last();
+  await card.waitFor({ state: "visible", timeout: 2000 }).catch(()=>{});
+
+  if (!(await card.count().catch(()=>0))) return null;
+
+  // Le texte complet, on parse
+  const txt = await card.innerText().catch(()=> "") || "";
+
+  // Nom: 1ère ligne non vide
+  const firstLine = txt.split("\n").map(t => t.trim()).filter(Boolean)[0] || "";
+  const project = norm(firstLine);
+
+  // MINTS 9H / 8H …
+  let mint_raw = null;
+  const m1 = txt.match(/MINTS?\s+(\d+\s*H)\b/i);
+  if (m1) mint_raw = m1[1].toUpperCase();
+
+  // Supply: on prend le 1er nombre « grand »
+  // (souvent "2 555" / "5 000" → digits())
+  let supply = null;
+  const candidateSup = txt.match(/(?:\b|^)([\d\s]{2,6})(?:\b|$)/g);
+  if (candidateSup) {
+    for (const c of candidateSup) {
+      const n = digits(c);
+      if (n && n >= 100 && n <= 200000) { supply = n; break; }
     }
   }
-  throw lastErr;
-}
 
-async function ensureTodayVisible(page) {
-  // gentle scroll to trigger right agenda rendering
-  await page.mouse.wheel(0, 1);
-  await page.waitForTimeout(300);
-}
-
-async function listTodayProjectBadges(page) {
-  // very loose selectors for the right agenda column
-  const candidates = await page.$$(
-    ':right-of(:text("FILTER")) [role="button"], ' +
-    ':right-of(:text("FILTER")) a, ' +
-    ':right-of(:text("FILTER")) [class*=Badge], ' +
-    ':right-of(:text("FILTER")) [class*=badge], ' +
-    '[class*=agenda] [role="button"], [class*=agenda] a'
-  );
-
-  const uniq = new Set();
-  const picked = [];
-  for (const el of candidates) {
-    try {
-      const txt = (await el.innerText()).trim();
-      if (!txt) continue;
-      // likely agenda entries: contain hh:mm OR are short chips
-      if (/\b\d{1,2}:\d{2}\b/.test(txt) || txt.length <= 22) {
-        const key = txt.slice(0, 80);
-        if (!uniq.has(key)) {
-          uniq.add(key);
-          picked.push(el);
-        }
-      }
-    } catch {}
-    if (picked.length >= MAX_ROWS) break;
+  // Prix: "FREE" ou un 0.xxx
+  let public_price_raw = null;
+  const pf = txt.match(/\bFREE\b/i);
+  if (pf) {
+    public_price_raw = "Free";
+  } else {
+    const pn = txt.match(/\b0\.\d{1,6}\b/);
+    if (pn) public_price_raw = pn[0];
   }
-  logDebug(`agenda candidates: ${candidates.length}, picked: ${picked.length}`);
-  return picked;
-}
 
-function parseCardData(text) {
-  const t = text.replace(/\u00A0/g, " ");
-  const firstLine = t.split("\n").find(Boolean) || "";
-  const project = firstLine.trim();
-
-  const mintMatch = t.match(/MINTS\s+(\d+)\s*H/i);
-  const mintRaw = mintMatch ? `${mintMatch[1]}H` : "";
-
-  const supplyMatch = t.match(/\b(\d[\d\s]{0,3}\d)\b(?=.*\bSUPPLY\b|\bMINTS\b|^\s*\d)/i) ||
-                      t.match(/^\s*\D*(\d[\d\s]{0,3}\d)/m);
-  const supply = supplyMatch ? digits(supplyMatch[1]) : null;
-
-  let publicPrice = /FREE/i.test(t) ? "Free" : null;
-  if (!publicPrice) {
-    const p = t.match(/\b(\d+(\.\d+)?(?:\s*[A-Z]+)?)\b(?!.*MINTS)/i);
-    if (p) publicPrice = p[1].replace(/\s+/g, "");
+  // Twitter / X dans la popover s'il y en a
+  let twitter_url = null;
+  const links = await card.locator("a[href]").all();
+  for (const a of links) {
+    const href = await a.getAttribute("href");
+    if (href && /twitter\.com|x\.com/i.test(href)) {
+      twitter_url = href;
+      break;
+    }
   }
-  if (!publicPrice) publicPrice = "Free";
+  const twitter_handle = handleFromUrl(twitter_url);
 
-  return { project, mintRaw, supply, publicPrice };
+  // Optionnel: la chaîne n'apparaît pas toujours sur cette popover
+  const chain = null;
+
+  return { project, mint_raw, chain, supply, public_price_raw, twitter_handle, twitter_url };
 }
 
-async function openCardFromAgenda(page, trigger) {
-  await trigger.scrollIntoViewIfNeeded().catch(()=>{});
-  await trigger.hover({ force: true }).catch(()=>{});
-  await trigger.click({ delay: 50 }).catch(()=>{});
-  await page.waitForTimeout(450);
-
-  const card = page.locator(
-    "[role='dialog'], [class*=Card]:has-text('MINTS'), [class*=card]:has([class*=MINTS])"
-  ).last();
-
-  if (await card.count()) return card;
-
-  const alt = page.locator("[class*=popover], [class*=tooltip], [class*=Card]").last();
-  if (await alt.count()) return alt;
-
-  return card; // empty locator
+// Cliquer un chip projet (dans la case du jour)
+async function openProjectCard(page, chip) {
+  try {
+    await chip.scrollIntoViewIfNeeded?.().catch(()=>{});
+    await chip.hover({ force: true }).catch(()=>{});
+    await page.waitForTimeout(120);
+    await chip.click({ delay: 40 }).catch(()=>{});
+    // petite attente pour la popover
+    await page.waitForTimeout(250);
+  } catch {}
 }
 
-(async () => {
+async function main() {
+  fs.mkdirSync(OUT_DIR, { recursive: true });
+  const traceDir = path.join(process.cwd(), "traces");
+  fs.mkdirSync(traceDir, { recursive: true });
+
   const browser = await chromium.launch({
     headless: true,
     args: ["--no-sandbox", "--disable-dev-shm-usage"]
   });
 
   const context = await browser.newContext({
-    viewport: { width: 1400, height: 1800 },
+    viewport: { width: 1400, height: 1100 },
     userAgent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari",
     locale: "en-US"
   });
-  await context.tracing.start({ screenshots: true, snapshots: true, sources: true });
 
+  await context.tracing.start({ screenshots: true, snapshots: true });
   const page = await context.newPage();
-  page.setDefaultNavigationTimeout(120_000);
-  page.setDefaultTimeout(90_000);
+  page.setDefaultNavigationTimeout(120000);
+  page.setDefaultTimeout(60000);
 
-  page.on("console", (msg) => logDebug(`[console] ${msg.type()} ${msg.text()}`));
-  page.on("pageerror", (err) => logDebug(`[pageerror] ${err.message}`));
-
-  const items = [];
   try {
-    await gotoWithRetry(page, URL);
-    await ensureTodayVisible(page);
+    await gotoCalendar(page);
 
-    const triggers = await listTodayProjectBadges(page);
+    const todayCell = await findTodayCell(page);
+    if (!todayCell) {
+      logDebug("No 'today' cell found");
+      throw new Error("Cannot locate today cell");
+    }
 
-    for (const trigger of triggers) {
+    // Dans la case, les "chips" projets (le design varie, on cast large)
+    const chipSelector = [
+      "a[role='button']",
+      "button",
+      "[class*='chip']",
+      "[class*='Badge']",
+      "[class*='tag']",
+      "[class*='pill']",
+      "a", // fallback
+    ].join(",");
+
+    const chips = await todayCell.locator(chipSelector).all();
+    logDebug(`Found ${chips.length} chips in Today cell`);
+
+    const take = Math.min(chips.length, MAX_ROWS);
+    const items = [];
+
+    for (let i = 0; i < take; i++) {
+      const chip = chips[i];
       try {
-        const card = await openCardFromAgenda(page, trigger);
-        if (!(await card.count())) continue;
-
-        const text = (await card.innerText()).trim();
-        const { project, mintRaw, supply, publicPrice } = parseCardData(text);
-
-        const chainGuess = /ETH/i.test(text) ? "eth" :
-                           /SOL/i.test(text) ? "sol" :
-                           /BASE/i.test(text) ? "base" :
-                           /APE\b|APECoin/i.test(text) ? "ape" :
-                           /ABS/i.test(text) ? "abs" :
-                           /HYPE/i.test(text) ? "hype" :
-                           /BTC/i.test(text) ? "btc" :
-                           /SEI/i.test(text) ? "sei" :
-                           /SUI/i.test(text) ? "sui" : "";
-
-        let twitterUrl = null;
-        const tw = await card.locator("a[href*='x.com'],a[href*='twitter.com']").first();
-        if (await tw.count().catch(()=>0)) {
-          twitterUrl = await tw.getAttribute("href");
-        }
-
-        const scraped_at_unix = Math.floor(Date.now() / 1000);
-        let event_unix_utc = null;
-
-        const m = mintRaw.match(/(\d+)\s*H/i);
-        if (m) {
-          event_unix_utc = scraped_at_unix + Number(m[1]) * 3600;
-        } else {
-          const badgeText = (await trigger.innerText().catch(()=>"" )) || "";
-          const t = badgeText.match(/\b(\d{1,2}):(\d{2})\b/);
-          if (t) {
-            const now = new Date();
-            event_unix_utc = Date.UTC(
-              now.getUTCFullYear(),
-              now.getUTCMonth(),
-              now.getUTCDate(),
-              Number(t[1]), Number(t[2]), 0
-            ) / 1000;
+        await openProjectCard(page, chip);
+        const row = await readFromPopover(page);
+        if (row && row.project) {
+          // éviter doublons par nom
+          if (!items.some(it => it.project === row.project)) {
+            items.push(row);
           }
         }
-        if (!event_unix_utc) continue;
-
-        const event_utc_hhmm = new Date(event_unix_utc * 1000).toISOString().slice(11, 16);
-
-        items.push({
-          project: norm(project),
-          mint_raw: norm(mintRaw),
-          chain: norm(chainGuess).toLowerCase(),
-          supply: supply ?? null,
-          public_price_raw: norm(publicPrice),
-          twitter_handle: handleFromUrl(twitterUrl),
-          twitter_url: twitterUrl || "",
-          scraped_at_unix,
-          event_unix_utc,
-          event_utc_hhmm
-        });
-
+        // fermer la pop si possible (Esc + clic à l’écart)
         await page.keyboard.press("Escape").catch(()=>{});
         await page.mouse.click(10, 10).catch(()=>{});
+        await page.waitForTimeout(150);
       } catch (e) {
-        logDebug(`[item error] ${e.message}`);
-        try { await page.screenshot({ path: `playwright-item-${Date.now()}.png`, fullPage: true }); } catch {}
+        logDebug(`chip#${i} error: ${e?.message || e}`);
       }
     }
 
-    // write outputs (even if 0 items)
+    // Sauvegardes
     const jsonPath = path.join(OUT_DIR, `alphabot_${stamp}.json`);
     fs.writeFileSync(jsonPath, JSON.stringify(items, null, 2), "utf-8");
 
     const header = [
-      "project","mint_raw","chain","supply","public_price_raw",
-      "twitter_handle","twitter_url","scraped_at_unix","event_unix_utc","event_utc_hhmm"
+      "project",
+      "mint_raw",
+      "chain",
+      "supply",
+      "public_price_raw",
+      "twitter_handle",
+      "twitter_url"
     ];
     const csv = [
       header.join(","),
       ...items.map(x => header.map(k => {
-        const v = x[k] == null ? "" : String(x[k]).replace(/"/g,'""');
+        const v = x[k] == null ? "" : String(x[k]).replace(/"/g, '""');
         return /[,"\n]/.test(v) ? `"${v}"` : v;
       }).join(","))
     ].join("\n");
     const csvPath = path.join(OUT_DIR, `alphabot_${stamp}.csv`);
     fs.writeFileSync(csvPath, csv, "utf-8");
 
-    logDebug(`Saved ${items.length} items`);
     console.log(`Saved: ${jsonPath}`);
     console.log(`Saved: ${csvPath}`);
-  } catch (e) {
-    logDebug(`[fatal] ${e.stack || e.message}`);
-    try { await page.screenshot({ path: `playwright-fatal-${Date.now()}.png`, fullPage: true }); } catch {}
-    // guarantee at least one file in /out:
-    fs.writeFileSync(path.join(OUT_DIR, "EMPTY.txt"), "scrape failed\n");
-    throw e; // keep non-zero exit to see “Failure”
+
+  } catch (err) {
+    logDebug(`FATAL: ${err?.message || err}`);
+    // dump screenshot pour debug
+    try {
+      await page.screenshot({ path: path.join(OUT_DIR, `playwright-${Date.now()}.png`), fullPage: true });
+    } catch {}
+    throw err;
   } finally {
-    try { await context.tracing.stop({ path: path.join(TRACE_DIR, `trace-${stamp}.zip`) }); } catch {}
-    await browser.close();
+    await context.tracing.stop({ path: path.join(traceDir, `trace-${Date.now()}.zip`) }).catch(()=>{});
+    await browser.close().catch(()=>{});
   }
-})();
+}
+
+main().catch(e => {
+  console.error(e);
+  process.exit(1);
+});
