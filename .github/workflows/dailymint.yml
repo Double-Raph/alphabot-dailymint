@@ -2,8 +2,8 @@ name: Daily Alphabot Scrape
 
 on:
   schedule:
-    - cron: "0 3-4 * * *"        # 03:00 & 04:00 UTC
-  workflow_dispatch: {}
+    - cron: "0 3-4 * * *"   # 03:00 et 04:00 UTC (≈ 05:00–06:00 Paris selon DST)
+  workflow_dispatch: {}     # lancement manuel si besoin
 
 permissions:
   contents: write
@@ -17,13 +17,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     env:
-      TZ: "Europe/Paris"
-      WINDOW_HOURS: "24"
-      # DAY_TZ: "Europe/Paris"   # uncomment if you want “today” in Paris TZ
+      TZ: "Europe/Paris"       # pour les logs
+      DAY_TZ: "Europe/Paris"   # filtre "aujourd'hui" dans ce fuseau
+      WINDOW_HOURS: ""         # laisse vide pour ignorer la fenêtre glissante
+      MAX_ROWS: "20"           # borne pour limiter le nombre de lignes cliquées
 
     steps:
       - uses: actions/checkout@v4
 
+      # Empêche un second run le même jour (date Paris)
       - name: Compute Paris date
         id: time
         run: echo "paris_date=$(TZ=Europe/Paris date +%F)" >> $GITHUB_OUTPUT
@@ -43,7 +45,7 @@ jobs:
         with:
           node-version: "20"
 
-      # ⬇️ Fallback: essaie npm ci (si lockfile présent), sinon npm install
+      # fonctionne avec ou sans package-lock.json
       - name: Install deps
         if: steps.lock.outputs.cache-hit != 'true'
         run: npm ci || npm install
@@ -52,14 +54,13 @@ jobs:
         if: steps.lock.outputs.cache-hit != 'true'
         run: npx playwright install --with-deps chromium
 
-      - name: Scrape
+      - name: Scrape (/projects)
         if: steps.lock.outputs.cache-hit != 'true'
         env:
-          MAX_ROWS: "25"
-          CALENDAR_URL: "https://www.alphabot.app/calendar"
-          DEBUG: "pw:api"
+          PROJECTS_URL: "https://www.alphabot.app/projects"
         run: node scraper.mjs
 
+      # Toujours uploader pour debug, même en cas d’échec
       - name: Ensure artifacts folder (always)
         if: always()
         run: |
