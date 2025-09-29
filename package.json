@@ -4,8 +4,7 @@
   "type": "module",
   "private": true,
   "scripts": {
-    "scrape": "node scraper.mjs",
-    "postinstall": "npx playwright install --with-deps"
+    "scrape": "node scraper.mjs"
   },
   "dependencies": {
     "playwright": "^1.47.0"
