@@ -2,87 +2,43 @@ name: Daily Alphabot Scrape
 
 on:
   schedule:
-    - cron: "0 3-4 * * *"   # 03:00 et 04:00 UTC (≈ 05:00–06:00 Paris selon DST)
-  workflow_dispatch: {}     # lancement manuel si besoin
+    - cron: "0 3-4 * * *"   # 03:00 et 04:00 UTC
+  workflow_dispatch: {}
 
 permissions:
   contents: write
 
-concurrency:
-  group: alphabot-daily
-  cancel-in-progress: true
-
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
     env:
-      TZ: "Europe/Paris"       # pour les logs
-      DAY_TZ: "Europe/Paris"   # filtre "aujourd'hui" dans ce fuseau
-      WINDOW_HOURS: ""         # laisse vide pour ignorer la fenêtre glissante
-      MAX_ROWS: "20"           # borne pour limiter le nombre de lignes cliquées
+      TZ: "Europe/Paris"
+      # Pas de filtre par défaut -> évite les CSV vides
+      ONLY_TODAY: "false"
+      DAY_TZ: "Europe/Paris"
+      MAX_ROWS: "20"
 
     steps:
       - uses: actions/checkout@v4
 
-      # Empêche un second run le même jour (date Paris)
-      - name: Compute Paris date
-        id: time
-        run: echo "paris_date=$(TZ=Europe/Paris date +%F)" >> $GITHUB_OUTPUT
-
-      - name: Check run-lock
-        id: lock
-        uses: actions/cache/restore@v4
-        with:
-          key: alphabot-runlock-${{ steps.time.outputs.paris_date }}
-          path: .runlock
-          restore-keys: |
-            alphabot-runlock-
-
       - name: Setup Node
-        if: steps.lock.outputs.cache-hit != 'true'
         uses: actions/setup-node@v4
         with:
           node-version: "20"
 
-      # fonctionne avec ou sans package-lock.json
       - name: Install deps
-        if: steps.lock.outputs.cache-hit != 'true'
-        run: npm ci || npm install
+        run: npm install
 
       - name: Install Playwright browsers
-        if: steps.lock.outputs.cache-hit != 'true'
         run: npx playwright install --with-deps chromium
 
-      - name: Scrape (/projects)
-        if: steps.lock.outputs.cache-hit != 'true'
-        env:
-          PROJECTS_URL: "https://www.alphabot.app/projects"
+      - name: Scrape
         run: node scraper.mjs
 
-      # Toujours uploader pour debug, même en cas d’échec
-      - name: Ensure artifacts folder (always)
-        if: always()
-        run: |
-          mkdir -p out traces
-          [ -f out/EMPTY.txt ] || echo "no data (failure or zero items)" > out/EMPTY.txt
-          [ -f traces/EMPTY.txt ] || echo "no trace" > traces/EMPTY.txt
-          [ -f debug.log ] || echo "no debug log" > debug.log
-
-      - name: Upload artifacts (always)
-        if: always()
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: alphabot-${{ github.run_id }}
           path: |
-            out/**
-            traces/**
-            playwright-*.png
-            debug.log
-
-      - name: Save run-lock (mark done for today)
-        if: steps.lock.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          key: alphabot-runlock-${{ steps.time.outputs.paris_date }}
-          path: .runlock
+            *.csv
+            *.json
