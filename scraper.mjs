@@ -1,252 +1,303 @@
-// scraper.mjs — Calendar scraper (alphabot.app/calendar)
-// Node >= 18, Playwright ^1.47
-// Sorties: out/alphabot_YYYYMMDD.json + .csv
-// DEBUG: traces + screenshots si souci
+// scraper.mjs — /projects (v4.2 stable)
+// - Va sur https://www.alphabot.app/projects
+// - Lit le tableau (NAME/MINT/CHAIN/SUPPLY/PUBLIC)
+// - Récupère le Twitter via hover sur NAME (fallback: clic + fermeture modale)
+// - Heures : lit tooltip/attributs de la cellule MINT ; fallback "+H"
+// - Filtre sur "aujourd'hui" dans DAY_TZ ; ignore "H ago" et formats non-H (ex: "2D")
+// - Ajoute event_unix_utc arrondi à l'heure la plus proche
+// - Sorties: out/alphabot_YYYYMMDD.json + .csv
 
 import { chromium } from "playwright";
 import fs from "fs";
 import path from "path";
 
-const CAL_URL  = "https://www.alphabot.app/calendar";
-const OUT_DIR  = path.join(process.cwd(), "out");
-const MAX_ROWS = Number(process.env.MAX_ROWS || 30);
+const URL = process.env.PROJECTS_URL || "https://www.alphabot.app/projects";
+const MAX_ROWS = Number(process.env.MAX_ROWS || 20);
+const OUT_DIR = path.join(process.cwd(), "out");
+const DAY_TZ = process.env.DAY_TZ || "Europe/Paris";
 
-// ---------- utils ----------
 const norm = (s) => (s ?? "").toString().trim();
-
 const digits = (s) => {
   const x = norm(s).replace(/[^\d]/g, "");
   return x ? Number(x) : null;
 };
-
-function handleFromUrl(u) {
+const handleFromUrl = (u) => {
   if (!u) return null;
   try {
     const url = new URL(u);
     if (!/x\.com|twitter\.com/i.test(url.hostname)) return null;
     const h = url.pathname.replace(/\//g, "").trim();
     return h ? `@${h}` : null;
-  } catch {
-    return null;
-  }
-}
-
-const todayUTC = new Date();
-const stamp = `${todayUTC.getUTCFullYear()}${String(todayUTC.getUTCMonth() + 1).padStart(2, "0")}${String(todayUTC.getUTCDate()).padStart(2, "0")}`;
+  } catch { return null; }
+};
 
 function logDebug(msg) {
-  fs.appendFileSync(path.join(OUT_DIR, "debug.log"), `[${new Date().toISOString()}] ${msg}\n`);
+  fs.appendFileSync("debug.log", `[${new Date().toISOString()}] ${msg}\n`);
 }
 
-// Attendre "l'un OU l'autre"
-async function waitForAny(page, waiters, overallTimeoutMs = 15000) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), overallTimeoutMs);
-  const wrapped = waiters.map(w => w().catch(() => new Promise(() => {})));
-  try {
-    await Promise.race(wrapped);
-  } finally {
-    clearTimeout(timer);
+function startOfDayUnixInTZ(date, tz = DAY_TZ) {
+  const fmt = new Intl.DateTimeFormat("en-GB", {
+    timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false
+  });
+  const parts = fmt.formatToParts(date).reduce((acc, p) => {
+    if (p.type !== "literal") acc[p.type] = p.value;
+    return acc;
+  }, {});
+  return Math.floor(Date.UTC(
+    Number(parts.year), Number(parts.month)-1, Number(parts.day), 0, 0, 0
+  ) / 1000);
+}
+
+function roundUnixToNearestHour(unix) {
+  const d = new Date(unix * 1000);
+  const min = d.getUTCMinutes();
+  if (min <= 30) d.setUTCMinutes(0,0,0);
+  else { d.setUTCMinutes(0,0,0); d.setUTCHours(d.getUTCHours()+1); }
+  return Math.floor(d.getTime() / 1000);
+}
+const hhmmUTC = (unix) => new Date(unix * 1000).toISOString().slice(11,16);
+
+// parse texte tooltip → epoch
+function parseDateTextToUnix(text) {
+  if (!text) return null;
+  const t = text.trim();
+  // ISO-like ou "Sep 15 2025 16:30 UTC"
+  const iso = Date.parse(t);
+  if (!Number.isNaN(iso)) return Math.floor(iso/1000);
+
+  // "HH:MM UTC" (jour courant en UTC)
+  let m = t.match(/(\d{1,2}):(\d{2})\s*UTC/i);
+  if (m) {
+    const now = new Date();
+    return Math.floor(Date.UTC(
+      now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(),
+      Number(m[1]), Number(m[2]), 0
+    ) / 1000);
   }
-}
 
-// Aller/attendre la page
-async function gotoCalendar(page) {
-  await page.goto(CAL_URL, { waitUntil: "domcontentloaded", timeout: 90000 }).catch(()=>{});
-  await page.waitForLoadState("networkidle", { timeout: 10000 }).catch(()=>{});
-
-  const calendarSelectors = '[role="grid"], [class*="Calendar"], [class*="calendar"]';
-  await waitForAny(page, [
-    () => page.locator("text=FILTER").first().waitFor({ state: "visible", timeout: 6000 }),
-    () => page.locator(calendarSelectors).first().waitFor({ state: "visible", timeout: 6000 }),
-  ], 18000);
-}
-
-// Trouver la case "Today" ou celle correspondant à la date du jour
-async function findTodayCell(page) {
-  // 1) essai direct "Today"
-  const byToday = page.locator("text=/^\\s*Today\\s*$/i").first();
-  if (await byToday.count().catch(()=>0)) {
-    // remonte à la cellule parent (case calendrier)
-    const cell = await byToday.locator("xpath=ancestor::*[self::*[contains(@role,'gridcell')] or self::*[contains(@class,'day')] or self::*[contains(@class,'cell')]][1]").first();
-    if (await cell.count().catch(()=>0)) return cell;
+  // "DD/MM/YYYY HH:MM" (interprété en UTC)
+  m = t.match(/(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{2,4})\s+(\d{1,2}):(\d{2})/);
+  if (m) {
+    const dd = Number(m[1]), mm = Number(m[2]), yyyy = Number(m[3].length===2 ? "20"+m[3] : m[3]);
+    const HH = Number(m[4]), MM = Number(m[5]);
+    return Math.floor(Date.UTC(yyyy, mm-1, dd, HH, MM, 0) / 1000);
   }
-
-  // 2) fallback: repérer un gridcell avec aria-selected=true
-  const selected = page.locator('[role="gridcell"][aria-selected="true"]').first();
-  if (await selected.count().catch(()=>0)) return selected;
-
-  // 3) fallback: jour numérique
-  const d = new Date();
-  const dd = String(d.getDate());
-  // un chiffre en haut à gauche de la case
-  const anyCell = page.locator(`[role="gridcell"]:has-text("${dd}")`).first();
-  if (await anyCell.count().catch(()=>0)) return anyCell;
-
-  // 4) dernier fallback: toute case visible du calendrier
-  const any = page.locator('[role="gridcell"]').first();
-  if (await any.count().catch(()=>0)) return any;
-
   return null;
 }
 
-// Extraire infos depuis la popover/modale
-async function readFromPopover(page) {
-  // la popover peut être: [role=dialog], [data-radix-popper-content-wrapper], etc.
-  const card = page.locator(
-    "[role='dialog'], [data-radix-popper-content-wrapper], [class*='popover'], [class*='TooltipContent'], [class*='card']"
-  ).last();
-  await card.waitFor({ state: "visible", timeout: 2000 }).catch(()=>{});
-
-  if (!(await card.count().catch(()=>0))) return null;
-
-  // Le texte complet, on parse
-  const txt = await card.innerText().catch(()=> "") || "";
-
-  // Nom: 1ère ligne non vide
-  const firstLine = txt.split("\n").map(t => t.trim()).filter(Boolean)[0] || "";
-  const project = norm(firstLine);
-
-  // MINTS 9H / 8H …
-  let mint_raw = null;
-  const m1 = txt.match(/MINTS?\s+(\d+\s*H)\b/i);
-  if (m1) mint_raw = m1[1].toUpperCase();
-
-  // Supply: on prend le 1er nombre « grand »
-  // (souvent "2 555" / "5 000" → digits())
-  let supply = null;
-  const candidateSup = txt.match(/(?:\b|^)([\d\s]{2,6})(?:\b|$)/g);
-  if (candidateSup) {
-    for (const c of candidateSup) {
-      const n = digits(c);
-      if (n && n >= 100 && n <= 200000) { supply = n; break; }
+async function readAbsoluteMintUnixFromCell(page, cell) {
+  // attributs sur la cellule / enfant
+  const attrs = ["title","aria-label","data-title","data-tooltip","data-original-title","data-tippy-content"];
+  for (const a of attrs) {
+    const v = await cell.getAttribute(a);
+    const u = parseDateTextToUnix(v);
+    if (u) return u;
+  }
+  const child = await cell.$("*");
+  if (child) {
+    for (const a of attrs) {
+      const v = await child.getAttribute(a);
+      const u = parseDateTextToUnix(v);
+      if (u) return u;
     }
   }
 
-  // Prix: "FREE" ou un 0.xxx
-  let public_price_raw = null;
-  const pf = txt.match(/\bFREE\b/i);
-  if (pf) {
-    public_price_raw = "Free";
-  } else {
-    const pn = txt.match(/\b0\.\d{1,6}\b/);
-    if (pn) public_price_raw = pn[0];
-  }
-
-  // Twitter / X dans la popover s'il y en a
-  let twitter_url = null;
-  const links = await card.locator("a[href]").all();
-  for (const a of links) {
-    const href = await a.getAttribute("href");
-    if (href && /twitter\.com|x\.com/i.test(href)) {
-      twitter_url = href;
-      break;
-    }
-  }
-  const twitter_handle = handleFromUrl(twitter_url);
-
-  // Optionnel: la chaîne n'apparaît pas toujours sur cette popover
-  const chain = null;
-
-  return { project, mint_raw, chain, supply, public_price_raw, twitter_handle, twitter_url };
-}
-
-// Cliquer un chip projet (dans la case du jour)
-async function openProjectCard(page, chip) {
+  // hover → tooltip
   try {
-    await chip.scrollIntoViewIfNeeded?.().catch(()=>{});
-    await chip.hover({ force: true }).catch(()=>{});
-    await page.waitForTimeout(120);
-    await chip.click({ delay: 40 }).catch(()=>{});
-    // petite attente pour la popover
-    await page.waitForTimeout(250);
+    await cell.hover({ force: true });
+    await page.waitForTimeout(450);
+    const tip = page.locator(
+      "[role='tooltip'], [data-radix-popper-content-wrapper], [class*='tooltip'], [class*='popover'], [class*='balloon']"
+    ).last();
+    if (await tip.count()) {
+      const txt = (await tip.innerText()).trim();
+      const u = parseDateTextToUnix(txt);
+      if (u) return u;
+    }
   } catch {}
+  return null;
 }
 
-async function main() {
+const nowUTC = new Date();
+const stamp = `${nowUTC.getUTCFullYear()}${String(nowUTC.getUTCMonth()+1).padStart(2,"0")}${String(nowUTC.getUTCDate()).padStart(2,"0")}`;
+
+(async () => {
   fs.mkdirSync(OUT_DIR, { recursive: true });
-  const traceDir = path.join(process.cwd(), "traces");
-  fs.mkdirSync(traceDir, { recursive: true });
 
   const browser = await chromium.launch({
     headless: true,
-    args: ["--no-sandbox", "--disable-dev-shm-usage"]
+    args: ["--no-sandbox","--disable-dev-shm-usage"]
   });
-
   const context = await browser.newContext({
-    viewport: { width: 1400, height: 1100 },
+    viewport: { width: 1366, height: 1700 },
     userAgent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari",
     locale: "en-US"
   });
-
-  await context.tracing.start({ screenshots: true, snapshots: true });
   const page = await context.newPage();
   page.setDefaultNavigationTimeout(120000);
   page.setDefaultTimeout(60000);
 
+  page.on("console", m => logDebug(`[console] ${m.type()} ${m.text()}`));
+  page.on("pageerror", e => logDebug(`[pageerror] ${e.message}`));
+
   try {
-    await gotoCalendar(page);
+    await page.goto(URL, { waitUntil: "domcontentloaded", timeout: 90000 }).catch(()=>{});
+    await page.waitForLoadState("networkidle", { timeout: 20000 }).catch(()=>{});
+    await page.waitForSelector("table, [role='rowgroup']", { timeout: 45000 });
 
-    const todayCell = await findTodayCell(page);
-    if (!todayCell) {
-      logDebug("No 'today' cell found");
-      throw new Error("Cannot locate today cell");
-    }
+    // headers
+    const headerTexts = await page.evaluate(() => {
+      const texts = [];
+      document.querySelectorAll("table thead tr th").forEach(th => texts.push((th.textContent||"").trim().toUpperCase()));
+      if (texts.length === 0) {
+        document.querySelectorAll("[role='columnheader']").forEach(h => texts.push((h.textContent||"").trim().toUpperCase()));
+      }
+      return texts;
+    });
+    const WANT = ["NAME","MINT","CHAIN","SUPPLY","PUBLIC"];
+    const idx = {};
+    for (const k of WANT) idx[k] = headerTexts.findIndex(t => t.startsWith(k));
 
-    // Dans la case, les "chips" projets (le design varie, on cast large)
-    const chipSelector = [
-      "a[role='button']",
-      "button",
-      "[class*='chip']",
-      "[class*='Badge']",
-      "[class*='tag']",
-      "[class*='pill']",
-      "a", // fallback
-    ].join(",");
+    // rows
+    let rows = await page.$$("table tbody tr");
+    if (rows.length === 0) rows = await page.$$("[role='rowgroup'] [role='row']");
+    const take = Math.min(rows.length, MAX_ROWS);
+    logDebug(`Rows detected: ${rows.length} → processing first ${take}`);
 
-    const chips = await todayCell.locator(chipSelector).all();
-    logDebug(`Found ${chips.length} chips in Today cell`);
-
-    const take = Math.min(chips.length, MAX_ROWS);
     const items = [];
+    const now = new Date();
+    const scraped_at_unix = Math.floor(now.getTime() / 1000);
+    const dayStart = startOfDayUnixInTZ(now, DAY_TZ);
+    const dayEnd = dayStart + 86400;
 
     for (let i = 0; i < take; i++) {
-      const chip = chips[i];
+      const row = rows[i];
+      let cells = await row.$$("td");
+      if (cells.length === 0) cells = await row.$$("[role='cell']");
+
+      const cellText = async (k) => {
+        const j = idx[k];
+        if (j < 0 || j >= cells.length) return "";
+        return (await cells[j].innerText()).trim();
+      };
+
+      const name   = await cellText("NAME");
+      const mint   = await cellText("MINT");
+      const chain  = await cellText("CHAIN");
+      const supply = await cellText("SUPPLY");
+      const pub    = await cellText("PUBLIC");
+
+      // Twitter via hover (fallback click)
+      let twitterUrl = null;
       try {
-        await openProjectCard(page, chip);
-        const row = await readFromPopover(page);
-        if (row && row.project) {
-          // éviter doublons par nom
-          if (!items.some(it => it.project === row.project)) {
-            items.push(row);
+        const jName = idx["NAME"];
+        if (jName >= 0 && jName < cells.length) {
+          const nameCell = cells[jName];
+          const anchor = await nameCell.$("a, [role='link'], span");
+          if (anchor) {
+            await anchor.scrollIntoViewIfNeeded?.().catch(()=>{});
+            const box = await anchor.boundingBox();
+            if (box) await page.mouse.move(box.x + box.width/2, box.y + Math.min(10, box.height/2));
+            await anchor.hover({ force: true });
+            await page.waitForTimeout(600);
+
+            const candidateSelectors = [
+              "[role='dialog'] a[href*='x.com']",
+              "[role='dialog'] a[href*='twitter.com']",
+              "[role='tooltip'] a[href*='x.com']",
+              "[role='tooltip'] a[href*='twitter.com']",
+              "[data-radix-popper-content-wrapper] a[href*='x.com']",
+              "[data-radix-popper-content-wrapper] a[href*='twitter.com']",
+              "[class*='popover'] a[href*='x.com']",
+              "[class*='popover'] a[href*='twitter.com']",
+              "[class*='tooltip'] a[href*='x.com']",
+              "[class*='tooltip'] a[href*='twitter.com']",
+              "[class*='card'] a[href*='x.com']",
+              "[class*='card'] a[href*='twitter.com']"
+            ];
+            const links = await page.$$(candidateSelectors.join(","));
+            for (const a of links) {
+              const href = await a.getAttribute("href");
+              if (href && !/alphabotapp/i.test(href) && !/intent|share/i.test(href)) { twitterUrl = href; break; }
+            }
           }
         }
-        // fermer la pop si possible (Esc + clic à l’écart)
-        await page.keyboard.press("Escape").catch(()=>{});
-        await page.mouse.click(10, 10).catch(()=>{});
-        await page.waitForTimeout(150);
-      } catch (e) {
-        logDebug(`chip#${i} error: ${e?.message || e}`);
+        if (!twitterUrl) {
+          await row.click({ delay: 60 });
+          await page.waitForTimeout(600);
+          const links = await page.$$(
+            "[role='dialog'] a[href*='x.com'], [role='dialog'] a[href*='twitter.com'], " +
+            "[class*='modal'] a[href*='x.com'], [class*='modal'] a[href*='twitter.com'], " +
+            "a[href*='x.com'], a[href*='twitter.com']"
+          );
+          for (const a of links) {
+            const href = await a.getAttribute("href");
+            if (href && !/alphabotapp/i.test(href) && !/intent|share/i.test(href)) { twitterUrl = href; break; }
+          }
+          await page.keyboard.press("Escape").catch(()=>{});
+          await page.mouse.click(10, 10).catch(()=>{});
+          await page.waitForTimeout(150);
+        }
+      } catch {}
+
+      // Heures: tooltip MINT → unix, sinon "+H", ignorer "H ago" / "2D"
+      let event_unix_utc = null;
+      try {
+        const jMint = idx["MINT"];
+        if (jMint >= 0 && jMint < cells.length) {
+          const mintCell = cells[jMint];
+          event_unix_utc = await readAbsoluteMintUnixFromCell(page, mintCell);
+        }
+      } catch {}
+
+      if (!event_unix_utc) {
+        const ahead = (mint || "").match(/^\s*(\d+)\s*H(?!\s*ago)\b/i);
+        const ago   = (mint || "").match(/^\s*(\d+)\s*H\s*ago\b/i);
+        if (ahead) {
+          event_unix_utc = scraped_at_unix + Number(ahead[1]) * 3600;
+        } else if (ago) {
+          continue; // déjà passé
+        } else {
+          continue; // formats non gérés (ex: "2D")
+        }
       }
+
+      // Garde uniquement les mints d'aujourd'hui (DAY_TZ)
+      if (!(event_unix_utc >= dayStart && event_unix_utc < dayEnd)) continue;
+
+      const event_unix_utc_rounded = roundUnixToNearestHour(event_unix_utc);
+      const event_utc_hhmm = hhmmUTC(event_unix_utc);
+      const event_utc_hhmm_rounded = hhmmUTC(event_unix_utc_rounded);
+
+      items.push({
+        project: norm(name),
+        mint_raw: norm(mint),
+        chain: norm(chain).toLowerCase(),
+        supply: supply ? digits(supply) : null,
+        public_price_raw: norm(pub),
+        twitter_handle: handleFromUrl(twitterUrl),
+        twitter_url: twitterUrl || "",
+        scraped_at_unix,
+        event_unix_utc,
+        event_unix_utc_rounded,
+        event_utc_hhmm,
+        event_utc_hhmm_rounded
+      });
     }
 
-    // Sauvegardes
+    // save
     const jsonPath = path.join(OUT_DIR, `alphabot_${stamp}.json`);
     fs.writeFileSync(jsonPath, JSON.stringify(items, null, 2), "utf-8");
 
     const header = [
-      "project",
-      "mint_raw",
-      "chain",
-      "supply",
-      "public_price_raw",
-      "twitter_handle",
-      "twitter_url"
+      "project","mint_raw","chain","supply","public_price_raw","twitter_handle","twitter_url",
+      "scraped_at_unix","event_unix_utc","event_unix_utc_rounded","event_utc_hhmm","event_utc_hhmm_rounded"
     ];
     const csv = [
       header.join(","),
       ...items.map(x => header.map(k => {
-        const v = x[k] == null ? "" : String(x[k]).replace(/"/g, '""');
+        const v = x[k] == null ? "" : String(x[k]).replace(/"/g,'""');
         return /[,"\n]/.test(v) ? `"${v}"` : v;
       }).join(","))
     ].join("\n");
@@ -255,21 +306,11 @@ async function main() {
 
     console.log(`Saved: ${jsonPath}`);
     console.log(`Saved: ${csvPath}`);
-
-  } catch (err) {
-    logDebug(`FATAL: ${err?.message || err}`);
-    // dump screenshot pour debug
-    try {
-      await page.screenshot({ path: path.join(OUT_DIR, `playwright-${Date.now()}.png`), fullPage: true });
-    } catch {}
-    throw err;
+  } catch (e) {
+    logDebug(`[fatal] ${e.stack || e.message}`);
+    try { await page.screenshot({ path: `playwright-fatal-${Date.now()}.png`, fullPage: true }); } catch {}
+    throw e;
   } finally {
-    await context.tracing.stop({ path: path.join(traceDir, `trace-${Date.now()}.zip`) }).catch(()=>{});
     await browser.close().catch(()=>{});
   }
-}
-
-main().catch(e => {
-  console.error(e);
-  process.exit(1);
-});
+})();
